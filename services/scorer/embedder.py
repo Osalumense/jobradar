@@ -6,7 +6,7 @@ from typing import List
 class GeminiEmbedder:
     def __init__(self):
         self.api_key = os.environ.get("GEMINI_API_KEY")
-        self.embedding_model = "models/text-embedding-004"
+        self.embedding_model = "models/gemini-embedding-001"
         
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY environment variable is not configured")
