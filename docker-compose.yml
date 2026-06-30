@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./services/scorer
+      dockerfile: Dockerfile
+    ports:
+      - "9089:9089"
+    env_file:
+      - .env
+    environment:
+      - PORT=9089
+      - HOST=0.0.0.0
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3078:3078"
+    environment:
+      - PORT=3078
+      - HOST=0.0.0.0
+      - DATABASE_URL=${DATABASE_URL}
+      - SCORER_API_URL=http://backend:9089
+    depends_on:
+      - backend
