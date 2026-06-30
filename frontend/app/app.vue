@@ -72,10 +72,10 @@
           <!-- Live Scraped Jobs -->
           <div v-for="job in jobs" :key="job.id" class="job-card glass hover-lift">
             <div class="card-header">
-              <span class="company-logo">{{ job.company.charAt(0) }}</span>
+              <span class="company-logo">{{ job.company ? job.company.charAt(0) : 'J' }}</span>
               <div class="job-title-wrapper">
-                <h4>{{ job.title }}</h4>
-                <span class="company-name">{{ job.company }}</span>
+                <h4>{{ job.title || 'Untitled Role' }}</h4>
+                <span class="company-name">{{ job.company || 'Unknown Company' }}</span>
               </div>
               <div class="match-badge" :class="getScoreClass(job.composite_score)">
                 <span class="score-num">{{ Math.round((job.composite_score || 0) * 100) }}%</span>
@@ -87,9 +87,9 @@
             <p class="job-description">{{ getExcerpt(job.description) }}</p>
 
             <div class="job-metadata">
-              <span class="meta-tag"><span class="icon">📍</span> {{ job.location || 'Paris' }}</span>
+              <span class="meta-tag"><span class="icon">📍</span> {{ job.location || 'Remote' }}</span>
               <span class="meta-tag"><span class="icon">📄</span> {{ job.contract_type ? job.contract_type.toUpperCase() : 'CDI' }}</span>
-              <span class="meta-tag source-tag" :class="job.source">{{ job.source.toUpperCase() }}</span>
+              <span class="meta-tag source-tag" :class="job.source || 'remotive'">{{ job.source ? job.source.toUpperCase() : 'REMOTIVE' }}</span>
             </div>
 
             <div class="card-actions">
@@ -103,7 +103,7 @@
           <div v-if="jobs.length === 0" class="empty-feed glass">
             <span class="empty-icon">📭</span>
             <h3>No jobs scanned yet</h3>
-            <p>Click "Scan Job Boards Now" to trigger a live WTTJ scraping pipeline.</p>
+            <p>Click "Scan Job Boards Now" to trigger a live scraping pipeline.</p>
           </div>
         </div>
       </section>
@@ -166,7 +166,9 @@ onMounted(() => {
 
 const getExcerpt = (text) => {
   if (!text) return ""
-  return text.length > 200 ? text.substring(0, 200) + "..." : text
+  // Strip HTML tags for clean preview
+  const clean = text.replace(/<\/?[^>]+(>|$)/g, "")
+  return clean.length > 200 ? clean.substring(0, 200) + "..." : clean
 }
 
 const getScoreClass = (score) => {
@@ -616,6 +618,12 @@ h3 {
   background: rgba(16, 185, 129, 0.1);
   color: #10b981;
   border: 1px solid rgba(16, 185, 129, 0.2);
+}
+
+.source-tag.remotive {
+  background: rgba(99, 102, 241, 0.1);
+  color: #6366f1;
+  border: 1px solid rgba(99, 102, 241, 0.2);
 }
 
 .card-actions {
