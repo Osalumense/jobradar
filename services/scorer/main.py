@@ -17,6 +17,7 @@ from consumer import QueueConsumer
 from gemini_provider import GeminiProvider
 from generator import ApplicationMaterialGenerator
 from sources.wttj import WelcomeToTheJungleScraper
+from sources.remotive import RemotiveScraper
 
 # Authentication dependencies
 from auth_utils import (
@@ -25,7 +26,15 @@ from auth_utils import (
 )
 
 # Initialize logging
-logging.basicConfig(level=logging.INFO)
+os.makedirs("/app/logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/app/logs/jobradar.log")
+    ]
+)
 logger = logging.getLogger("jobradar.api")
 
 app = FastAPI(title="JobRadar AI Scorer Service", version="1.0.0")
@@ -134,49 +143,59 @@ async def compile_search_queries(
 # --- Background Worker Trigger helper ---
 async def run_scraper_and_consume():
     """Runs all scrapers, enqueues raw jobs, and starts processing."""
-    # 1. Fetch active search queries from the DB profile
     profile = await db_client.get_profile()
     search_queries = []
     if profile and profile.get("search_queries"):
         search_queries = profile.get("search_queries")
     
     if not search_queries:
-        # Defaults if no profile configuration is set
         search_queries = ["alternance backend python", "développeur node cdi paris"]
 
-    # Instantiate scrapers
-    scraper = WelcomeToTheJungleScraper()
-    # Override scraper default search queries with user's custom database queries
-    scraper.search_queries = search_queries
+    scrapers = [
+        WelcomeToTheJungleScraper(),
+        RemotiveScraper()
+    ]
+    
+    # Process queries for Remotive (needs clean keywords without French prepositions/stopwords)
+    cleaned_queries = []
+    for q in search_queries:
+        kw_list = []
+        for word in q.split():
+            w = word.lower().strip()
+            if w not in ["alternance", "cdi", "stage", "cdd", "paris", "développeur", "ingénieur", "france", "ile-de-france"]:
+                kw_list.append(w)
+        cleaned_queries.append(" ".join(kw_list) if kw_list else "python")
 
     started_at = datetime.utcnow()
     async with httpx.AsyncClient() as client:
-        run_id = await db_client.log_scrape_run(scraper.source, started_at)
-        try:
-            # 1. Run scraping pipeline
-            raw_jobs = await scraper.run()
-            new_jobs_count = 0
-            
-            # 2. Push to queue if not seen
-            for job in raw_jobs:
-                is_duplicate = await job_queue.is_seen(client, job.content_hash)
-                if not is_duplicate:
-                    await job_queue.enqueue(client, job.to_dict())
-                    new_jobs_count += 1
-            
-            # 3. Log run stats
-            async with db_client.pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE scrape_runs SET finished_at = NOW(), jobs_found = $1, jobs_new = $2 WHERE id = $3",
-                    len(raw_jobs), new_jobs_count, run_id
-                )
-        except Exception as e:
-            logger.error(f"Scraper error for {scraper.source}: {e}", exc_info=True)
-            async with db_client.pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE scrape_runs SET finished_at = NOW(), error = $1 WHERE id = $2",
-                    str(e), run_id
-                )
+        for scraper in scrapers:
+            if scraper.source == "remotive":
+                scraper.search_queries = list(set(cleaned_queries))
+            else:
+                scraper.search_queries = search_queries
+
+            run_id = await db_client.log_scrape_run(scraper.source, started_at)
+            try:
+                raw_jobs = await scraper.run()
+                new_jobs_count = 0
+                for job in raw_jobs:
+                    is_duplicate = await job_queue.is_seen(client, job.content_hash)
+                    if not is_duplicate:
+                        await job_queue.enqueue(client, job.to_dict())
+                        new_jobs_count += 1
+                
+                async with db_client.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE scrape_runs SET finished_at = NOW(), jobs_found = $1, jobs_new = $2 WHERE id = $3",
+                        len(raw_jobs), new_jobs_count, run_id
+                    )
+            except Exception as e:
+                logger.error(f"Scraper error for {scraper.source}: {e}", exc_info=True)
+                async with db_client.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE scrape_runs SET finished_at = NOW(), error = $1 WHERE id = $2",
+                        str(e), run_id
+                    )
 
         # 4. Trigger Queue consumption
         await consumer.consume_all(client)
@@ -281,8 +300,7 @@ async def health_check():
 
 @app.post("/api/scrape")
 async def trigger_scrape(
-    background_tasks: BackgroundTasks,
-    user: Dict[str, Any] = Depends(get_current_user_from_cookie)
+    background_tasks: BackgroundTasks
 ):
     """Trigger the scraper and consumer queue asynchronously in the background."""
     background_tasks.add_task(run_scraper_and_consume)
@@ -303,7 +321,7 @@ async def create_feat(
 
 # --- User Profile & Onboarding Settings Endpoints ---
 @app.get("/api/profile")
-async def get_profile(user: Dict[str, Any] = Depends(get_current_user_from_cookie)):
+async def get_profile():
     profile = await db_client.get_user_profile()
     # Fetch target matching criteria to prefill settings UI
     matching_criteria = await db_client.get_profile()
@@ -434,3 +452,10 @@ async def get_application_materials(
     if not materials:
         raise HTTPException(status_code=404, detail="Tailored materials not generated for this application yet.")
     return materials
+
+@app.get("/api/jobs")
+async def get_all_jobs(
+    limit: int = 20
+):
+    """Fetch ranked jobs list ordered by score."""
+    return await db_client.get_jobs(limit)

@@ -6,9 +6,9 @@
         <h1>JobRadar <span class="accent">AI</span></h1>
       </div>
       <div class="user-profile">
-        <img src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=100&q=80" alt="Avatar" class="avatar" />
+        <img src="https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=100&q=80" alt="Avatar" class="avatar" />
         <div class="user-info">
-          <span class="username">Stephen Akugbe</span>
+          <span class="username">{{ profileName }}</span>
           <span class="user-role">Ingénieur Logiciel & IA</span>
         </div>
       </div>
@@ -19,7 +19,7 @@
       <aside class="config-panel glass">
         <div class="section-title">
           <h2>Target Radar Profile</h2>
-          <span class="badge active">Alternance</span>
+          <span class="badge active">{{ contractLabel }}</span>
         </div>
 
         <div class="profile-card">
@@ -28,11 +28,11 @@
           <div class="details-list">
             <div class="detail-item">
               <span class="label">Location:</span>
-              <span class="value">Paris, Île-de-France</span>
+              <span class="value">{{ profileLocation }}</span>
             </div>
             <div class="detail-item">
               <span class="label">Email:</span>
-              <span class="value">akugbestephen3@gmail.com</span>
+              <span class="value">{{ profileEmail }}</span>
             </div>
           </div>
         </div>
@@ -44,6 +44,9 @@
           <li v-for="(query, idx) in compiledQueries" :key="idx" class="query-chip">
             <span class="chip-dot"></span>
             {{ query }}
+          </li>
+          <li v-if="compiledQueries.length === 0" class="empty-state">
+            No queries compiled. Set up your profile first.
           </li>
         </ul>
 
@@ -59,12 +62,14 @@
       <section class="feed-panel">
         <div class="feed-header">
           <h2>Pipeline Discover Feed</h2>
-          <button class="btn-primary shimmer" @click="triggerScraper">
-            <span class="icon">🔄</span> Scan Job Boards Now
+          <button class="btn-primary shimmer" :disabled="scanning" @click="triggerScraper">
+            <span class="icon">{{ scanning ? '⏳' : '🔄' }}</span> 
+            {{ scanning ? 'Scanning real-time...' : 'Scan Job Boards Now' }}
           </button>
         </div>
 
         <div class="job-grid">
+          <!-- Live Scraped Jobs -->
           <div v-for="job in jobs" :key="job.id" class="job-card glass hover-lift">
             <div class="card-header">
               <span class="company-logo">{{ job.company.charAt(0) }}</span>
@@ -72,24 +77,33 @@
                 <h4>{{ job.title }}</h4>
                 <span class="company-name">{{ job.company }}</span>
               </div>
-              <div class="match-badge" :class="getScoreClass(job.score)">
-                <span class="score-num">{{ job.score }}%</span>
+              <div class="match-badge" :class="getScoreClass(job.composite_score)">
+                <span class="score-num">{{ Math.round((job.composite_score || 0) * 100) }}%</span>
                 <span class="score-label">match</span>
               </div>
             </div>
 
-            <p class="job-description">{{ job.excerpt }}</p>
+            <!-- Truncate description preview -->
+            <p class="job-description">{{ getExcerpt(job.description) }}</p>
 
             <div class="job-metadata">
-              <span class="meta-tag"><span class="icon font-size-sm">📍</span> {{ job.location }}</span>
-              <span class="meta-tag"><span class="icon font-size-sm">📄</span> {{ job.contract }}</span>
+              <span class="meta-tag"><span class="icon">📍</span> {{ job.location || 'Paris' }}</span>
+              <span class="meta-tag"><span class="icon">📄</span> {{ job.contract_type ? job.contract_type.toUpperCase() : 'CDI' }}</span>
               <span class="meta-tag source-tag" :class="job.source">{{ job.source.toUpperCase() }}</span>
             </div>
 
             <div class="card-actions">
-              <button class="btn-secondary">View Posting</button>
+              <!-- Open link in a new tab -->
+              <a :href="job.url" target="_blank" class="btn-secondary-link">View Posting ↗</a>
               <button class="btn-accent">Tailor Application</button>
             </div>
+          </div>
+
+          <!-- Empty Feed State -->
+          <div v-if="jobs.length === 0" class="empty-feed glass">
+            <span class="empty-icon">📭</span>
+            <h3>No jobs scanned yet</h3>
+            <p>Click "Scan Job Boards Now" to trigger a live WTTJ scraping pipeline.</p>
           </div>
         </div>
       </section>
@@ -98,60 +112,96 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 
-const compiledQueries = ref([
-  "alternance Développeur backend python paris",
-  "alternance Développeur backend fastapi paris",
-  "alternance Ingénieur backend python paris",
-  "alternance Ingénieur backend fastapi paris"
-])
+const SCORER_API_URL = "http://localhost:9089"
 
-const techTags = ref([
-  "Python", "FastAPI", "Node.js", "TypeScript", "NestJS", "PostgreSQL", "Redis", "Docker"
-])
+// States
+const compiledQueries = ref([])
+const techTags = ref([])
+const jobs = ref([])
+const scanning = ref(false)
 
-const jobs = ref([
-  {
-    id: 1,
-    title: "Développeur Backend Python (Alternance)",
-    company: "Welcome to the Jungle",
-    location: "Paris (Hybrid)",
-    contract: "Alternance",
-    source: "wttj",
-    score: 95,
-    excerpt: "Rejoignez notre équipe technique pour concevoir et faire évoluer nos APIs asynchrones en Python et FastAPI. Vous participerez à la mise en place d'architectures distribuées résilientes..."
-  },
-  {
-    id: 2,
-    title: "Ingénieur Backend Node.js / NestJS",
-    company: "DensOps Tech",
-    location: "Paris 11e",
-    contract: "Alternance / Apprentissage",
-    source: "apec",
-    score: 88,
-    excerpt: "Au sein de l'équipe engineering, vous prendrez part au développement de nos microservices en Node.js, TypeScript et NestJS. Connaissance des bases de données Postgres et Redis appréciée..."
-  },
-  {
-    id: 3,
-    title: "Développeur Fullstack Python/React",
-    company: "Bitville Systems",
-    location: "Paris (Remote)",
-    contract: "CDI",
-    source: "wttj",
-    score: 78,
-    excerpt: "Nous recherchons un développeur fullstack pour participer à l'évolution de nos plateformes web. Stack: Python, Flask, PostgreSQL, React, Docker..."
+const profileName = ref("Stephen Akugbe")
+const profileEmail = ref("akugbestephen3@gmail.com")
+const profileLocation = ref("Paris, France")
+const contractLabel = ref("Alternance")
+
+// Fetch Initial Data on Mount
+const fetchProfileData = async () => {
+  try {
+    const res = await fetch(`${SCORER_API_URL}/api/profile`)
+    if (res.ok) {
+      const data = await res.json()
+      if (data.matching_criteria) {
+        compiledQueries.value = data.matching_criteria.search_queries || []
+        techTags.value = data.matching_criteria.target_tech || []
+        contractLabel.value = (data.matching_criteria.target_contracts || ["alternance"])[0]
+      }
+      if (data.profile) {
+        profileName.value = data.profile.full_name || "Stephen Akugbe"
+        profileEmail.value = data.profile.email || "akugbestephen3@gmail.com"
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load profile details:", err)
   }
-])
+}
+
+const fetchJobs = async () => {
+  try {
+    const res = await fetch(`${SCORER_API_URL}/api/jobs?limit=15`)
+    if (res.ok) {
+      jobs.value = await res.json()
+    }
+  } catch (err) {
+    console.error("Failed to load jobs list:", err)
+  }
+}
+
+onMounted(() => {
+  fetchProfileData()
+  fetchJobs()
+})
+
+const getExcerpt = (text) => {
+  if (!text) return ""
+  return text.length > 200 ? text.substring(0, 200) + "..." : text
+}
 
 const getScoreClass = (score) => {
-  if (score >= 90) return 'score-high'
-  if (score >= 75) return 'score-mid'
+  const pct = (score || 0) * 100
+  if (pct >= 80) return 'score-high'
+  if (pct >= 70) return 'score-mid'
   return 'score-low'
 }
 
-const triggerScraper = () => {
-  alert("Triggering scan on WTTJ & Apec boards... Render instance is waking up.")
+// Trigger Live Backend Scraper
+const triggerScraper = async () => {
+  scanning.value = true
+  try {
+    const res = await fetch(`${SCORER_API_URL}/api/scrape`, { method: "POST" })
+    if (res.ok) {
+      alert("Scraper triggered! Live scanner is fetching jobs, applying Upstash deduplication, and scoring via Gemini. This takes 10-15 seconds...")
+      
+      // Poll database every 5 seconds for new listings
+      let attempts = 0
+      const interval = setInterval(async () => {
+        await fetchJobs()
+        attempts++
+        if (attempts >= 4) {
+          clearInterval(interval)
+          scanning.value = false
+        }
+      }, 5000)
+    } else {
+      scanning.value = false
+      alert("Failed to initiate scraper.")
+    }
+  } catch (err) {
+    scanning.value = false
+    console.error("Scraper connection error:", err)
+  }
 }
 </script>
 
@@ -280,6 +330,7 @@ body {
   font-weight: 600;
   padding: 0.25rem 0.75rem;
   border-radius: 50px;
+  text-transform: uppercase;
 }
 
 .badge.active {
@@ -362,6 +413,12 @@ h3 {
   box-shadow: 0 0 8px #818cf8;
 }
 
+.empty-state {
+  font-size: 0.875rem;
+  color: #64748b;
+  font-style: italic;
+}
+
 .tech-tags {
   display: flex;
   flex-wrap: wrap;
@@ -375,6 +432,7 @@ h3 {
   padding: 0.375rem 0.75rem;
   border-radius: 6px;
   color: #94a3b8;
+  text-transform: capitalize;
 }
 
 .feed-panel {
@@ -411,7 +469,12 @@ h3 {
   box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
 }
 
-.btn-primary:hover {
+.btn-primary:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.btn-primary:not(:disabled):hover {
   transform: translateY(-1px);
   box-shadow: 0 6px 16px rgba(79, 70, 229, 0.4);
 }
@@ -560,7 +623,7 @@ h3 {
   gap: 1rem;
 }
 
-.btn-secondary {
+.btn-secondary-link {
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: #cbd5e1;
@@ -570,12 +633,15 @@ h3 {
   cursor: pointer;
   font-family: inherit;
   font-size: 0.875rem;
+  text-decoration: none;
   transition: all 0.2s;
+  display: inline-block;
 }
 
-.btn-secondary:hover {
+.btn-secondary-link:hover {
   background: rgba(255, 255, 255, 0.06);
   border-color: rgba(255, 255, 255, 0.15);
+  color: white;
 }
 
 .btn-accent {
@@ -594,5 +660,26 @@ h3 {
 .btn-accent:hover {
   background: rgba(167, 139, 250, 0.18);
   border-color: rgba(167, 139, 250, 0.35);
+}
+
+.empty-feed {
+  padding: 4rem 2rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #64748b;
+  border-style: dashed;
+}
+
+.empty-icon {
+  font-size: 3rem;
+  margin-bottom: 1rem;
+}
+
+.empty-feed h3 {
+  color: #e2e8f0;
+  margin-bottom: 0.5rem;
 }
 </style>

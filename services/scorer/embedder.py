@@ -24,7 +24,7 @@ class GeminiEmbedder:
         # google-generativeai offers embed_content; we wrap it defensively
         response = genai.embed_content(
             model=self.embedding_model,
-            contents=cleaned_text,
+            content=cleaned_text,
             task_type="retrieval_document"
         )
         return response.get("embedding", [])

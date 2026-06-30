@@ -215,6 +215,17 @@ class DatabaseClient:
                     name, email, phone, github, linkedin, master_cv
                 )
 
+    async def get_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Fetch ranked jobs ordered by composite match score."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM jobs ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT $1",
+                limit
+            )
+            return [dict(r) for r in rows]
+
     # --- User Accounts ---
     async def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         """Fetch user credentials by username."""

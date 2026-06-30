@@ -12,6 +12,9 @@ services:
     environment:
       - PORT=9089
       - HOST=0.0.0.0
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./logs:/app/logs
 
   frontend:
     build:
