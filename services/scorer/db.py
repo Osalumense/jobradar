@@ -61,6 +61,14 @@ class DatabaseClient:
         if not self.pool:
             await self.connect()
 
+        posted_at = job.get("posted_at")
+        if isinstance(posted_at, str):
+            try:
+                from datetime import datetime
+                posted_at = datetime.fromisoformat(posted_at)
+            except ValueError:
+                posted_at = None
+
         async with self.pool.acquire() as conn:
             # We insert with a conflict clause on content_hash or external_id (handled in database unique constraints)
             # The spec specifies: UNIQUE(source, external_id) and UNIQUE(content_hash)
@@ -72,16 +80,16 @@ class DatabaseClient:
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (source, external_id) DO UPDATE 
                 SET url = EXCLUDED.url,
-                    title = EXCLUDED.title,
-                    location = EXCLUDED.location,
-                    contract_type = EXCLUDED.contract_type,
-                    tech_stack = EXCLUDED.tech_stack,
-                    description = EXCLUDED.description
+                	title = EXCLUDED.title,
+                	location = EXCLUDED.location,
+                	contract_type = EXCLUDED.contract_type,
+                	tech_stack = EXCLUDED.tech_stack,
+                	description = EXCLUDED.description
                 RETURNING id
                 """,
                 job["external_id"], job["source"], job["url"], job["title"], job["company"],
                 job["location"], job["contract_type"], job["tech_stack"], job["description"],
-                job["posted_at"], job["content_hash"]
+                posted_at, job["content_hash"]
             )
             return str(row["id"])
 
