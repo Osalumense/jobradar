@@ -25,9 +25,51 @@ class QueueConsumer:
         self.embedder = embedder
         self.alerter = alerter
 
-    async def process_next_job(self, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-        """Pop a job from the Redis queue, score it, save it, and alert if high match."""
-        # 1. Fetch next job from Upstash Redis Queue
+
+
+    async def consume_all(self, client: httpx.AsyncClient, user_id: Optional[str] = None) -> int:
+        """Process all currently queued jobs. Caches profile embedding for the run."""
+        profile = await self.db.get_profile(user_id)
+        if not profile:
+            logger.warning("Consumer: no profile configured, skipping queue.")
+            return 0
+
+        profile_text = profile.get("profile_text", "")
+        logger.info("Consumer: fetching profile embedding for this run...")
+        profile_embedding = await self.embedder.get_embedding(profile_text)
+
+        processed_count = 0
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 5
+
+        while True:
+            try:
+                result = await self._process_next(client, profile, profile_text, profile_embedding, user_id)
+                if result is None:
+                    break
+                processed_count += 1
+                consecutive_errors = 0
+                logger.info(
+                    f"Processed [{processed_count}]: {result['title']} @ {result['company']} "
+                    f"— score={result['score']:.2f}"
+                )
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"Consumer error (attempt {consecutive_errors}): {e}", exc_info=True)
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    logger.error(f"Stopping consumer after {MAX_CONSECUTIVE_ERRORS} consecutive errors")
+                    break
+                continue
+
+        logger.info(f"Consumer finished. Jobs processed this run: {processed_count}")
+        return processed_count
+
+    async def _process_next(
+        self, client: httpx.AsyncClient,
+        profile: dict, profile_text: str, profile_embedding: list,
+        user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Pop one job from queue, score it using the pre-fetched profile embedding, save it."""
         job_data = await self.queue.dequeue(client)
         if not job_data:
             return None
@@ -36,28 +78,10 @@ class QueueConsumer:
         if not content_hash:
             return None
 
-        # Double check seen list (dedup fallback)
         if await self.queue.is_seen(client, content_hash):
-            logger.info(f"Deduplication fallback: Job {job_data.get('title')} already processed. Skipping.")
+            logger.info(f"Dedup: '{job_data.get('title')}' already processed, skipping.")
             return None
 
-        # 2. Fetch the target profile configuration from Postgres
-        profile = await self.db.get_profile()
-        if not profile:
-            logger.warning("No target profile configured in database. Skipping scoring.")
-            return None
-
-        profile_text = profile.get("profile_text", "")
-        keywords = profile.get("keywords", [])
-        excluded = profile.get("excluded", [])
-        min_score = profile.get("min_score", 0.65)
-
-        # Pre-embed profile text using Gemini Embedding
-        # In a real environment, we'd cache this in memory or in DB to save tokens.
-        # Let's fetch the embedding for target profile text:
-        profile_embedding = await self.embedder.get_embedding(profile_text)
-
-        # 3. Parse posted_at date
         posted_at_str = job_data.get("posted_at")
         posted_at = None
         if posted_at_str:
@@ -66,36 +90,32 @@ class QueueConsumer:
             except ValueError:
                 pass
 
-        # 4. Calculate Scores
         score_details = await self.scorer.score_job(
             description=job_data.get("description", ""),
             posted_at=posted_at,
             profile_text=profile_text,
             profile_embedding=profile_embedding,
-            keywords=keywords,
-            excluded=excluded
+            keywords=profile.get("keywords", []),
+            excluded=profile.get("excluded", []),
+            contract_type=job_data.get("contract_type"),
+            location=job_data.get("location"),
+            target_contracts=profile.get("target_contracts", []),
+            target_locations=profile.get("target_locations", [])
         )
 
-        # 5. Insert job details into Neon database
         job_id = await self.db.insert_job(job_data)
-        
-        # 6. Apply matching scores back to database row
-        await self.db.update_job_scores(job_id, score_details)
+        await self.db.update_job_scores(job_id, score_details, user_id)
 
-        # 7. Check alert criteria
         composite_score = score_details.get("composite", 0.0)
         email_sent = False
-        
+        min_score = profile.get("min_score", 0.65)
+
         if composite_score >= min_score:
-            # Send Resend email notification
             email_sent = await self.alerter.send_job_alert(client, job_data, score_details)
-            
-            # Update alerted flag in DB
             if email_sent:
                 async with self.db.pool.acquire() as conn:
                     await conn.execute("UPDATE jobs SET alerted = TRUE WHERE id = $1", job_id)
 
-        # 8. Mark as seen in Upstash Redis Set
         await self.queue.mark_seen(client, content_hash)
 
         return {
@@ -105,18 +125,3 @@ class QueueConsumer:
             "score": composite_score,
             "alerted": email_sent
         }
-
-    async def consume_all(self, client: httpx.AsyncClient) -> int:
-        """Process all currently queued jobs in sequence."""
-        processed_count = 0
-        while True:
-            try:
-                result = await self.process_next_job(client)
-                if not result:
-                    break
-                processed_count += 1
-                logger.info(f"Processed job: {result['title']} at {result['company']} - Score: {result['score']}")
-            except Exception as e:
-                logger.error(f"Error processing job from queue: {e}", exc_info=True)
-                break
-        return processed_count

@@ -131,3 +131,6 @@ VALUES (
   ARRAY['alternance backend python', 'développeur node typescript cdi', 'alternance fastapi nestjs']
 )
 ON CONFLICT (id) DO NOTHING;
+
+-- Migration: add Q&A answers column to job_materials
+ALTER TABLE job_materials ADD COLUMN IF NOT EXISTS qa_answers TEXT;

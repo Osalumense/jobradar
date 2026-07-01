@@ -68,3 +68,13 @@ def get_current_user_from_cookie(request: Request) -> Dict[str, Any]:
             detail="Authentication credentials missing"
         )
     return decode_token(token)
+
+def get_optional_user_from_cookie(request: Request) -> Optional[Dict[str, Any]]:
+    """Like get_current_user_from_cookie but returns None instead of raising when unauthenticated."""
+    token = request.cookies.get("access_token")
+    if not token:
+        return None
+    try:
+        return decode_token(token)
+    except Exception:
+        return None

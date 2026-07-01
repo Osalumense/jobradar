@@ -27,34 +27,58 @@ class DatabaseClient:
             await self.pool.close()
             self.pool = None
 
-    async def get_profile(self) -> Optional[Dict[str, Any]]:
-        """Fetch the matching target profile settings."""
+    async def get_profile(self, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Fetch the matching target profile for a user (falls back to id=1 if no user_id)."""
         if not self.pool:
             await self.connect()
-        
+
         async with self.pool.acquire() as conn:
+            if user_id:
+                row = await conn.fetchrow("SELECT * FROM profile WHERE user_id = $1 LIMIT 1", user_id)
+                if row:
+                    return dict(row)
+            # Fallback to legacy singleton row
             row = await conn.fetchrow("SELECT * FROM profile WHERE id = 1 LIMIT 1")
             return dict(row) if row else None
 
-    async def save_profile(self, profile_text: str, keywords: List[str], excluded: List[str], min_score: float) -> None:
-        """Upsert target profile preferences."""
+    async def save_profile(self, profile_text: str, keywords: List[str], excluded: List[str], min_score: float, user_id: Optional[str] = None) -> None:
+        """Upsert target profile preferences for a user."""
         if not self.pool:
             await self.connect()
 
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO profile (id, profile_text, keywords, excluded, min_score, updated_at)
-                VALUES (1, $1, $2, $3, $4, NOW())
-                ON CONFLICT (id) DO UPDATE
-                SET profile_text = EXCLUDED.profile_text,
-                    keywords = EXCLUDED.keywords,
-                    excluded = EXCLUDED.excluded,
-                    min_score = EXCLUDED.min_score,
-                    updated_at = NOW()
-                """,
-                profile_text, keywords, excluded, min_score
-            )
+            if user_id:
+                existing = await conn.fetchval("SELECT id FROM profile WHERE user_id = $1", user_id)
+                if existing:
+                    await conn.execute(
+                        """
+                        UPDATE profile SET profile_text=$1, keywords=$2, excluded=$3, min_score=$4, updated_at=NOW()
+                        WHERE user_id=$5
+                        """,
+                        profile_text, keywords, excluded, min_score, user_id
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        INSERT INTO profile (profile_text, keywords, excluded, min_score, user_id, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, NOW())
+                        """,
+                        profile_text, keywords, excluded, min_score, user_id
+                    )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO profile (id, profile_text, keywords, excluded, min_score, updated_at)
+                    VALUES (1, $1, $2, $3, $4, NOW())
+                    ON CONFLICT (id) DO UPDATE
+                    SET profile_text = EXCLUDED.profile_text,
+                        keywords = EXCLUDED.keywords,
+                        excluded = EXCLUDED.excluded,
+                        min_score = EXCLUDED.min_score,
+                        updated_at = NOW()
+                    """,
+                    profile_text, keywords, excluded, min_score
+                )
 
     async def insert_job(self, job: Dict[str, Any]) -> str:
         """Insert or update a scraped job, returning its database UUID."""
@@ -93,26 +117,38 @@ class DatabaseClient:
             )
             return str(row["id"])
 
-    async def update_job_scores(self, job_id: str, scores: Dict[str, Any]) -> None:
-        """Apply matching scores to a job posting."""
+    async def update_job_scores(self, job_id: str, scores: Dict[str, Any], user_id: Optional[str] = None) -> None:
+        """Apply matching scores to a job. If user_id provided, writes to job_scores; else updates jobs table directly."""
         if not self.pool:
             await self.connect()
 
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE jobs 
-                SET semantic_score = $1,
-                    tfidf_score = $2,
-                    recency_score = $3,
-                    composite_score = $4,
-                    tech_stack = $5,
-                    scored_at = NOW()
-                WHERE id = $6
-                """,
-                scores["semantic"], scores["keyword"], scores["recency"], scores["composite"],
-                scores["tech_stack"], job_id
-            )
+            if user_id:
+                await conn.execute(
+                    """
+                    INSERT INTO job_scores (job_id, user_id, semantic_score, keyword_score, recency_score, composite_score, tech_stack, scored_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                    ON CONFLICT (job_id, user_id) DO UPDATE
+                    SET semantic_score=$3, keyword_score=$4, recency_score=$5, composite_score=$6, tech_stack=$7, scored_at=NOW()
+                    """,
+                    job_id, user_id, scores["semantic"], scores["keyword"], scores["recency"],
+                    scores["composite"], scores["tech_stack"]
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE jobs
+                    SET semantic_score = $1,
+                        tfidf_score = $2,
+                        recency_score = $3,
+                        composite_score = $4,
+                        tech_stack = $5,
+                        scored_at = NOW()
+                    WHERE id = $6
+                    """,
+                    scores["semantic"], scores["keyword"], scores["recency"], scores["composite"],
+                    scores["tech_stack"], job_id
+                )
 
     async def get_job_by_id(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve details of a single job."""
@@ -163,6 +199,14 @@ class DatabaseClient:
             )
             return str(row["id"])
 
+    async def delete_feat(self, feat_id: str) -> bool:
+        """Delete an accomplishment by ID."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM user_feats WHERE id = $1", feat_id)
+            return result == "DELETE 1"
+
     # --- CV & Cover Letters (Materials) ---
     async def get_materials(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Fetch custom tailored application documents for a job."""
@@ -172,22 +216,23 @@ class DatabaseClient:
             row = await conn.fetchrow("SELECT * FROM job_materials WHERE job_id = $1 LIMIT 1", job_id)
             return dict(row) if row else None
 
-    async def save_materials(self, job_id: str, tailored_cv: str, cover_letter: str) -> None:
-        """Save AI tailored CV and Cover letter documents."""
+    async def save_materials(self, job_id: str, tailored_cv: str, cover_letter: str, qa_answers: Optional[str] = None) -> None:
+        """Save AI tailored CV, cover letter, and optional Q&A answers."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO job_materials (job_id, tailored_cv, cover_letter, generated_at)
-                VALUES ($1, $2, $3, NOW())
+                INSERT INTO job_materials (job_id, tailored_cv, cover_letter, qa_answers, generated_at)
+                VALUES ($1, $2, $3, $4, NOW())
                 ON CONFLICT (job_id) DO UPDATE
                 SET tailored_cv = EXCLUDED.tailored_cv,
                     cover_letter = EXCLUDED.cover_letter,
+                    qa_answers = EXCLUDED.qa_answers,
                     generated_at = NOW(),
                     version = job_materials.version + 1
                 """,
-                job_id, tailored_cv, cover_letter
+                job_id, tailored_cv, cover_letter, qa_answers
             )
 
     async def get_user_profile(self) -> Optional[Dict[str, Any]]:
@@ -223,36 +268,86 @@ class DatabaseClient:
                     name, email, phone, github, linkedin, master_cv
                 )
 
-    async def get_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Fetch ranked jobs ordered by composite match score."""
+    async def get_jobs(self, limit: int = 20, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch scraped jobs with scores. If user_id, merges per-user scores from job_scores."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM jobs ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT $1",
-                limit
-            )
+            if user_id:
+                rows = await conn.fetch(
+                    """
+                    SELECT j.*,
+                           js.semantic_score  AS semantic_score,
+                           js.keyword_score   AS tfidf_score,
+                           js.recency_score   AS recency_score,
+                           js.composite_score AS composite_score,
+                           COALESCE(js.tech_stack, j.tech_stack) AS tech_stack,
+                           js.scored_at, js.alerted
+                    FROM jobs j
+                    LEFT JOIN job_scores js ON js.job_id = j.id AND js.user_id = $2
+                    ORDER BY js.composite_score DESC NULLS LAST, j.scraped_at DESC
+                    LIMIT $1
+                    """,
+                    limit, user_id
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM jobs ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT $1",
+                    limit
+                )
             return [dict(r) for r in rows]
 
     # --- User Accounts ---
-    async def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
-        """Fetch user credentials by username."""
+    async def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """Fetch user credentials by email."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM users WHERE username = $1 LIMIT 1", username)
+            row = await conn.fetchrow("SELECT * FROM users WHERE email = $1 LIMIT 1", email.lower().strip())
             return dict(row) if row else None
 
-    async def create_user(self, username: str, password_hash: str) -> str:
+    async def create_user(self, email: str, password_hash: str) -> str:
         """Register a new user account."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id",
-                username, password_hash
+                "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id",
+                email.lower().strip(), email.lower().strip(), password_hash
             )
             return str(row["id"])
+
+    async def set_reset_token(self, email: str, token: str, expires_at) -> bool:
+        """Store a password reset token for the given email."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET reset_token=$1, reset_token_expires=$2 WHERE email=$3",
+                token, expires_at, email.lower().strip()
+            )
+            return result == "UPDATE 1"
+
+    async def get_user_by_reset_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Fetch user by a valid (non-expired) reset token."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE reset_token=$1 AND reset_token_expires > NOW()",
+                token
+            )
+            return dict(row) if row else None
+
+    async def reset_password(self, user_id: str, password_hash: str) -> None:
+        """Update password and clear reset token."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET password_hash=$1, reset_token=NULL, reset_token_expires=NULL WHERE id=$2",
+                password_hash, user_id
+            )
 
     async def count_users(self) -> int:
         """Get the total number of registered users."""

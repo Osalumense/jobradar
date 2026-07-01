@@ -1,5 +1,5 @@
 import re
-from typing import List, Set, Tuple
+from typing import List, Tuple
 
 class KeywordMatcher:
     @staticmethod
@@ -9,27 +9,14 @@ class KeywordMatcher:
 
     def calculate_score(self, text: str, keywords: List[str], excluded: List[str]) -> Tuple[float, List[str]]:
         """
-        Calculate a keyword match ratio (0-1) and check for exclusion criteria.
+        Calculate a keyword match ratio (0-1).
         
         Returns:
-            - score (float): ratio of matched keywords (0.0 if excluded keywords found)
+            - score (float): ratio of matched keywords
             - matched_words (List[str]): list of matching keywords found in text
         """
         cleaned_text = self.clean_text(text)
-        text_tokens = set(cleaned_text.split())
-        
-        # 1. Exclusion Check (strict check)
-        # Check if any exclusion phrases appear in the raw lowercase description
-        desc_lower = text.lower()
-        for exc in excluded:
-            exc_clean = exc.lower().strip()
-            if not exc_clean:
-                continue
-            # Use regex word boundaries or substring match for safety
-            if exc_clean in desc_lower:
-                return 0.0, []
 
-        # 2. Match Keywords
         matched = []
         if not keywords:
             return 1.0, []

@@ -44,11 +44,11 @@ class BaseScraper(ABC):
     
     # Generic developer search queries targeting both Alternance and CDI
     search_queries: list[str] = [
-        "alternance backend",
-        "développeur node typescript",
-        "ingénieur python fastapi",
-        "backend developer cdi",
-        "développeur nestjs cdi"
+        "alternance développeur backend paris",
+        "développeur backend cdi paris",
+        "ingénieur logiciel alternance paris",
+        "développeur fullstack cdi paris",
+        "développeur web alternance paris"
     ]
 
     @abstractmethod

@@ -5,10 +5,12 @@ from embedder import GeminiEmbedder
 from keyword_matcher import KeywordMatcher
 
 WEIGHTS = {
-    "semantic": 0.55,
-    "keyword": 0.30,
+    "semantic": 0.45,
+    "keyword": 0.40,
     "recency": 0.15,
 }
+
+PREFERENCE_MISMATCH_FACTOR = 0.75
 
 class CompositeScorer:
     def __init__(self, embedder: GeminiEmbedder, matcher: KeywordMatcher):
@@ -38,39 +40,44 @@ class CompositeScorer:
         profile_text: str, 
         profile_embedding: List[float],
         keywords: List[str], 
-        excluded: List[str]
+        excluded: List[str],
+        contract_type: str | None,
+        location: str | None,
+        target_contracts: List[str],
+        target_locations: List[str]
     ) -> Dict[str, Any]:
-        """Compute the final composite matching score."""
-        
-        # 1. Keyword check & Exclusions (Fast fail)
-        keyword_score, matched_words = self.matcher.calculate_score(description, keywords, excluded)
-        
-        # If the job contains exclusion criteria, score is automatically 0
-        if keyword_score == 0.0 and len(excluded) > 0:
-            return {
-                "semantic": 0.0,
-                "keyword": 0.0,
-                "recency": 0.0,
-                "composite": 0.0,
-                "tech_stack": matched_words
-            }
+        """Compute a final composite score without hiding imperfect matches."""
+        preference_factor = 1.0
 
-        # 2. Semantic matching via Gemini Embeddings API
+        if target_contracts and contract_type:
+            job_contract = contract_type.lower().strip()
+            if not any(tc.lower().strip() in job_contract for tc in target_contracts):
+                preference_factor *= PREFERENCE_MISMATCH_FACTOR
+
+        if target_locations and location:
+            job_loc = location.lower().strip()
+            matched_loc = False
+            for tl in target_locations:
+                tl_clean = tl.lower().strip()
+                if tl_clean in job_loc:
+                    matched_loc = True
+                    break
+            if not matched_loc:
+                preference_factor *= PREFERENCE_MISMATCH_FACTOR
+
+        keyword_score, matched_words = self.matcher.calculate_score(description, keywords, excluded)
+
         job_embedding = await self.embedder.get_embedding(description)
         semantic_score = self.embedder.cosine_similarity(profile_embedding, job_embedding)
-        
-        # Normalize semantic score range (shifting negative bounds if any)
         semantic_score = max(0.0, min(1.0, semantic_score))
 
-        # 3. Recency decay calculation
         recency = self.calculate_recency(posted_at)
 
-        # 4. Weighted Composite Score
         composite = (
             semantic_score * WEIGHTS["semantic"] +
             keyword_score * WEIGHTS["keyword"] +
             recency * WEIGHTS["recency"]
-        )
+        ) * preference_factor
 
         return {
             "semantic": round(semantic_score, 4),

@@ -1,7 +1,17 @@
 import httpx
+import logging
 from datetime import datetime
 from typing import AsyncGenerator
 from sources.base import BaseScraper, RawJob
+
+logger = logging.getLogger("jobradar.scraper.remotive")
+
+# Only English tech/role keywords make sense for Remotive (global English-language API)
+RELEVANT_CATEGORIES = {
+    "software-dev", "devops-sysadmin", "backend", "frontend", "full-stack",
+    "engineering", "data", "mobile"
+}
+
 
 class RemotiveScraper(BaseScraper):
     source = "remotive"
@@ -20,31 +30,36 @@ class RemotiveScraper(BaseScraper):
         return "cdi"
 
     async def fetch_listings(self, query: str) -> AsyncGenerator[RawJob, None]:
-        """Fetch remote job listings from Remotive public API."""
         async with httpx.AsyncClient(timeout=20.0) as client:
             params = {
                 "search": query,
-                "limit": 10
+                "limit": 15
             }
             headers = {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
-            
+
             try:
                 response = await client.get(self.base_url, params=params, headers=headers)
                 if response.status_code != 200:
+                    logger.warning(f"Remotive returned HTTP {response.status_code} for query '{query}'")
                     return
 
                 data = response.json()
                 jobs = data.get("jobs", [])
-                
+                logger.info(f"Remotive query '{query}': {len(jobs)} jobs")
+
                 for job in jobs:
-                    # Parse publication date
+                    # Skip clearly non-technical roles
+                    category = job.get("category", "").lower().replace(" ", "-")
+                    if category and not any(cat in category for cat in RELEVANT_CATEGORIES):
+                        logger.debug(f"Remotive: skipping non-tech category '{category}' for '{job.get('title')}'")
+                        continue
+
                     pub_date_str = job.get("publication_date")
                     posted_at = None
                     if pub_date_str:
                         try:
-                            # Remotive date format typically: "2026-06-30T12:00:00"
                             posted_at = datetime.fromisoformat(pub_date_str)
                         except ValueError:
                             pass
@@ -62,5 +77,4 @@ class RemotiveScraper(BaseScraper):
                         tech_stack=job.get("tags", [])
                     )
             except Exception as e:
-                print(f"Error calling Remotive API: {e}")
-                return
+                logger.error(f"Remotive scraper error for query '{query}': {e}", exc_info=True)

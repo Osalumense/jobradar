@@ -18,21 +18,25 @@ from gemini_provider import GeminiProvider
 from generator import ApplicationMaterialGenerator
 from sources.wttj import WelcomeToTheJungleScraper
 from sources.remotive import RemotiveScraper
+from sources.hellowork import HelloWorkScraper
+from sources.france_travail import FranceTravailScraper
+from sources.lesjeudis import LesJeudiscraper
 
 # Authentication dependencies
 from auth_utils import (
-    hash_password, verify_password, create_access_token, 
-    create_refresh_token, decode_token, get_current_user_from_cookie
+    hash_password, verify_password, create_access_token,
+    create_refresh_token, decode_token, get_current_user_from_cookie,
+    get_optional_user_from_cookie
 )
 
-# Initialize logging
-os.makedirs("/app/logs", exist_ok=True)
+LOG_DIR = os.environ.get("JOBRADAR_LOG_DIR", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("/app/logs/jobradar.log")
+        logging.FileHandler(os.path.join(LOG_DIR, "jobradar.log"))
     ]
 )
 logger = logging.getLogger("jobradar.api")
@@ -78,13 +82,24 @@ async def shutdown():
 
 # --- Pydantic Schema Models ---
 class UserAuthSchema(BaseModel):
-    username: str
+    email: str
     password: str
+
+class ForgotPasswordSchema(BaseModel):
+    email: str
+
+class ResetPasswordSchema(BaseModel):
+    token: str
+    new_password: str
 
 class FeatCreateSchema(BaseModel):
     title: str
     description: str
     skills_used: List[str] = Field(default_factory=list)
+
+class GenerateMaterialsSchema(BaseModel):
+    selected_feat_ids: Optional[List[str]] = None
+    application_questions: Optional[str] = None
 
 class UserProfileSchema(BaseModel):
     full_name: str
@@ -99,6 +114,66 @@ class UserProfileSchema(BaseModel):
     target_contracts: List[str] = Field(default_factory=list)
     target_locations: List[str] = Field(default_factory=list)
 
+KNOWN_TECH_TERMS = [
+    "python", "php", "node", "nodejs", "node.js", "typescript", "javascript",
+    "fastapi", "nestjs", "express", "laravel", "symfony", "react", "vue",
+    "nuxt", "postgres", "postgresql", "mysql", "redis", "docker", "kubernetes",
+    "aws", "gcp", "azure", "sql", "mongodb", "django", "flask", "graphql",
+    "rest", "ci/cd", "gitlab", "github actions"
+]
+
+GENERIC_SEARCH_QUERIES = [
+    "alternance développeur backend paris",
+    "développeur backend cdi paris",
+    "ingénieur logiciel alternance paris",
+    "développeur fullstack alternance paris",
+]
+
+
+def _dedupe_keep_order(values: List[str]) -> List[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        clean = value.strip()
+        key = clean.lower()
+        if clean and key not in seen:
+            seen.add(key)
+            deduped.append(clean)
+    return deduped
+
+
+def extract_profile_tech(master_cv: str, explicit_tech: List[str]) -> List[str]:
+    """Merge explicit UI tech choices with technologies found in the uploaded CV."""
+    cv_lower = master_cv.lower()
+    detected = []
+    for tech in KNOWN_TECH_TERMS:
+        if tech.lower() in cv_lower:
+            detected.append(tech)
+    return _dedupe_keep_order([*explicit_tech, *detected])
+
+
+def build_search_queries(
+    roles: List[str], tech: List[str], contracts: List[str], locations: List[str]
+) -> List[str]:
+    """Build deterministic profile-driven queries without assuming a specific stack."""
+    if not roles and not tech:
+        return GENERIC_SEARCH_QUERIES
+
+    selected_roles = roles or ["développeur backend", "développeur fullstack"]
+    selected_tech = tech or [""]
+    selected_contracts = contracts or ["cdi", "alternance"]
+    selected_locations = locations or ["paris"]
+
+    queries = []
+    for contract in selected_contracts:
+        for role in selected_roles:
+            for item in selected_tech:
+                for location in selected_locations:
+                    query = " ".join(part for part in [contract, role, item, location] if part).strip()
+                    queries.append(query)
+
+    return _dedupe_keep_order(queries)[:12]
+
 
 # --- Helper: LLM Search Query Compiler ---
 async def compile_search_queries(
@@ -106,8 +181,7 @@ async def compile_search_queries(
 ) -> List[str]:
     """Ask Gemini to generate natural French search query terms from onboarding preferences."""
     if not roles or not tech:
-        # Fallback to combinatorial if inputs are empty
-        return ["alternance backend python", "développeur node cdi"]
+        return build_search_queries(roles, tech, contracts, locations)
 
     prompt = f"""
     Create a clean list of exactly 6 optimized French job board search queries (comma-separated, e.g. "alternance développeur node paris") 
@@ -130,30 +204,34 @@ async def compile_search_queries(
         return [q for q in queries if q][:8]
     except Exception as e:
         logger.error(f"Error compiling search queries via Gemini: {e}")
-        # Deterministic fallback combination
-        fallback = []
-        for role in roles[:2]:
-            for t in tech[:2]:
-                for contract in contracts[:2]:
-                    loc = locations[0] if locations else "paris"
-                    fallback.append(f"{contract} {role} {t} {loc}")
-        return fallback[:6]
+        return build_search_queries(roles, tech, contracts, locations)
 
 
 # --- Background Worker Trigger helper ---
-async def run_scraper_and_consume():
-    """Runs all scrapers, enqueues raw jobs, and starts processing."""
-    profile = await db_client.get_profile()
+async def run_scraper_and_consume(user_id: Optional[str] = None):
+    """Runs all scrapers, enqueues raw jobs, and starts processing for a user."""
+    profile = await db_client.get_profile(user_id)
     search_queries = []
     if profile and profile.get("search_queries"):
         search_queries = profile.get("search_queries")
     
     if not search_queries:
-        search_queries = ["alternance backend python", "développeur node cdi paris"]
+        if profile:
+            search_queries = build_search_queries(
+                profile.get("target_roles", []),
+                profile.get("target_tech", []),
+                profile.get("target_contracts", []),
+                profile.get("target_locations", []),
+            )
+        else:
+            search_queries = GENERIC_SEARCH_QUERIES
 
     scrapers = [
         WelcomeToTheJungleScraper(),
-        RemotiveScraper()
+        HelloWorkScraper(),
+        FranceTravailScraper(),
+        LesJeudiscraper(),
+        RemotiveScraper(),
     ]
     
     # Process queries for Remotive (needs clean keywords without French prepositions/stopwords)
@@ -164,9 +242,10 @@ async def run_scraper_and_consume():
             w = word.lower().strip()
             if w not in ["alternance", "cdi", "stage", "cdd", "paris", "développeur", "ingénieur", "france", "ile-de-france"]:
                 kw_list.append(w)
-        cleaned_queries.append(" ".join(kw_list) if kw_list else "python")
+        cleaned_queries.append(" ".join(kw_list) if kw_list else "developer")
 
     started_at = datetime.utcnow()
+    total_enqueued = 0
     async with httpx.AsyncClient() as client:
         for scraper in scrapers:
             if scraper.source == "remotive":
@@ -183,7 +262,13 @@ async def run_scraper_and_consume():
                     if not is_duplicate:
                         await job_queue.enqueue(client, job.to_dict())
                         new_jobs_count += 1
-                
+
+                total_enqueued += new_jobs_count
+                logger.info(
+                    f"Scraper '{scraper.source}' done: {len(raw_jobs)} fetched, "
+                    f"{new_jobs_count} new, {len(raw_jobs) - new_jobs_count} duplicates"
+                )
+
                 async with db_client.pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE scrape_runs SET finished_at = NOW(), jobs_found = $1, jobs_new = $2 WHERE id = $3",
@@ -197,38 +282,36 @@ async def run_scraper_and_consume():
                         str(e), run_id
                     )
 
-        # 4. Trigger Queue consumption
-        await consumer.consume_all(client)
+        logger.info(f"All scrapers done. Total new jobs enqueued: {total_enqueued}")
+
+        # Trigger queue consumption for the requesting user
+        await consumer.consume_all(client, user_id=user_id)
 
 
 # --- Authentication REST Endpoints ---
 
 @app.post("/api/auth/register")
 async def register(auth_data: UserAuthSchema):
-    """Register a new user account. Locked for single-tenant safety once first user exists."""
-    existing_user_count = await db_client.count_users()
-    if existing_user_count > 0:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Registration is disabled. Only one self-hosted account is allowed."
-        )
-    
+    """Register a new user account."""
+    existing = await db_client.get_user_by_email(auth_data.email)
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists.")
     hashed = hash_password(auth_data.password)
-    user_id = await db_client.create_user(auth_data.username, hashed)
+    user_id = await db_client.create_user(auth_data.email, hashed)
     return {"message": "Account registered successfully.", "user_id": user_id}
 
 @app.post("/api/auth/login")
 async def login(auth_data: UserAuthSchema, response: Response):
     """Authenticate credentials and set HttpOnly session cookies."""
-    user = await db_client.get_user_by_username(auth_data.username)
+    user = await db_client.get_user_by_email(auth_data.email)
     if not user or not verify_password(auth_data.password, user["password_hash"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
+            detail="Incorrect email or password"
         )
     
     # Generate tokens
-    user_payload = {"sub": user["username"], "user_id": str(user["id"])}
+    user_payload = {"sub": user["email"], "user_id": str(user["id"])}
     access_token = create_access_token(user_payload)
     refresh_token = create_refresh_token(user_payload)
     
@@ -239,7 +322,7 @@ async def login(auth_data: UserAuthSchema, response: Response):
         value=access_token,
         httponly=True,
         secure=True,
-        samesite="strict",
+        samesite="lax",
         max_age=15 * 60  # 15 minutes
     )
     response.set_cookie(
@@ -247,12 +330,12 @@ async def login(auth_data: UserAuthSchema, response: Response):
         value=refresh_token,
         httponly=True,
         secure=True,
-        samesite="strict",
+        samesite="lax",
         path="/api/auth/refresh",  # Only sent during refreshes
         max_age=7 * 24 * 60 * 60  # 7 days
     )
     
-    return {"message": "Login successful", "username": user["username"]}
+    return {"message": "Login successful", "email": user["email"], "user_id": str(user["id"])}
 
 @app.post("/api/auth/refresh")
 async def refresh_session(request: Request, response: Response):
@@ -267,13 +350,14 @@ async def refresh_session(request: Request, response: Response):
     payload = decode_token(refresh_token, require_refresh=True)
     user_payload = {"sub": payload["sub"], "user_id": payload["user_id"]}
     new_access_token = create_access_token(user_payload)
+
     
     response.set_cookie(
         key="access_token",
         value=new_access_token,
         httponly=True,
         secure=True,
-        samesite="strict",
+        samesite="lax",
         max_age=15 * 60
     )
     
@@ -282,14 +366,59 @@ async def refresh_session(request: Request, response: Response):
 @app.post("/api/auth/logout")
 async def logout(response: Response):
     """Delete authentication cookies."""
-    response.delete_cookie(key="access_token", samesite="strict")
-    response.delete_cookie(key="refresh_token", path="/api/auth/refresh", samesite="strict")
+    response.delete_cookie(key="access_token", samesite="lax")
+    response.delete_cookie(key="refresh_token", path="/api/auth/refresh", samesite="lax")
     return {"message": "Logged out successfully"}
 
 @app.get("/api/auth/me")
 async def get_me(user: Dict[str, Any] = Depends(get_current_user_from_cookie)):
     """Retrieve logged-in user information."""
-    return {"username": user["sub"], "user_id": user["user_id"]}
+    return {"email": user["sub"], "user_id": user["user_id"]}
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(data: ForgotPasswordSchema):
+    """Generate a reset token and email it via Resend. Always returns 200 to prevent email enumeration."""
+    import secrets
+    from datetime import datetime, timedelta, timezone
+    user = await db_client.get_user_by_email(data.email)
+    if user:
+        token = secrets.token_urlsafe(32)
+        expires = datetime.now(timezone.utc) + timedelta(hours=1)
+        await db_client.set_reset_token(data.email, token, expires)
+        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3078")
+        reset_link = f"{frontend_url}/reset-password?token={token}"
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {os.environ.get('RESEND_API_KEY', '').strip()}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": os.environ.get("ALERT_FROM_EMAIL", "JobRadar AI <onboarding@resend.dev>"),
+                    "to": [data.email],
+                    "subject": "Reset your JobRadar AI password",
+                    "html": f"""
+                    <div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+                      <h2 style="color:#10b981">JobRadar AI</h2>
+                      <p>You requested a password reset. Click the button below — this link expires in <strong>1 hour</strong>.</p>
+                      <a href="{reset_link}" style="display:inline-block;background:#10b981;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">Reset Password</a>
+                      <p style="color:#64748b;font-size:0.875rem">If you didn't request this, ignore this email.</p>
+                    </div>
+                    """
+                }
+            )
+    return {"message": "If an account with that email exists, a reset link has been sent."}
+
+@app.post("/api/auth/reset-password")
+async def reset_password(data: ResetPasswordSchema):
+    """Verify reset token and update password."""
+    user = await db_client.get_user_by_reset_token(data.token)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset link.")
+    hashed = hash_password(data.new_password)
+    await db_client.reset_password(str(user["id"]), hashed)
+    return {"message": "Password updated successfully. You can now log in."}
 
 
 # --- Protected Application REST Endpoints ---
@@ -300,10 +429,12 @@ async def health_check():
 
 @app.post("/api/scrape")
 async def trigger_scrape(
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    user: Dict[str, Any] = Depends(get_current_user_from_cookie)
 ):
-    """Trigger the scraper and consumer queue asynchronously in the background."""
-    background_tasks.add_task(run_scraper_and_consume)
+    """Trigger the scraper and consumer queue for the authenticated user."""
+    user_id = user.get("user_id") if user else None
+    background_tasks.add_task(run_scraper_and_consume, user_id)
     return {"message": "Scraping and matching pipeline scheduled in background."}
 
 # --- Vault Feats Endpoints ---
@@ -319,13 +450,19 @@ async def create_feat(
     feat_id = await db_client.insert_feat(feat.title, feat.description, feat.skills_used)
     return {"message": "Accomplishment successfully saved.", "id": feat_id}
 
+@app.delete("/api/feats/{feat_id}")
+async def delete_feat(feat_id: str, user: Dict[str, Any] = Depends(get_current_user_from_cookie)):
+    deleted = await db_client.delete_feat(feat_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Feat not found")
+    return {"message": "Accomplishment deleted."}
+
 # --- User Profile & Onboarding Settings Endpoints ---
 @app.get("/api/profile")
-async def get_profile():
+async def get_profile(user: Optional[Dict[str, Any]] = Depends(get_optional_user_from_cookie)):
     profile = await db_client.get_user_profile()
-    # Fetch target matching criteria to prefill settings UI
-    matching_criteria = await db_client.get_profile()
-    
+    user_id = user.get("user_id") if user else None
+    matching_criteria = await db_client.get_profile(user_id)
     return {
         "profile": profile,
         "matching_criteria": matching_criteria
@@ -346,49 +483,70 @@ async def save_profile(
         master_cv=profile.master_cv
     )
     
+    profile_tech = extract_profile_tech(profile.master_cv, profile.target_tech)
+
     # 2. Compile optimized scraper queries via Gemini
     search_queries = await compile_search_queries(
         roles=profile.target_roles,
-        tech=profile.target_tech,
+        tech=profile_tech,
         contracts=profile.target_contracts,
         locations=profile.target_locations
     )
     
-    # 3. Update active scoring profile parameters
-    # The tech stack array becomes the TF-IDF matching keywords
-    # Excluded keywords filter out mismatched posts (e.g. if Alternance is selected, Stage is blocked)
-    excluded = ["java", ".net", "c#"]
-    if "alternance" in profile.target_contracts and "stage" not in profile.target_contracts:
-        excluded.append("stage uniquement")
+    # 3. Update active scoring profile parameters.
+    # Excluded terms are retained as metadata but no longer hard-delete jobs from scoring.
+    excluded = []
 
-    # Upsert profile settings in the database
+    # Upsert profile settings in the database (per-user if authenticated)
+    uid = user.get("user_id") if user else None
     async with db_client.pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO profile (
-                id, profile_text, keywords, excluded, min_score, 
-                target_roles, target_tech, target_contracts, target_locations, search_queries, updated_at
-            ) VALUES (1, $1, $2, $3, 0.75, $4, $5, $6, $7, $8, NOW())
-            ON CONFLICT (id) DO UPDATE
-            SET profile_text = EXCLUDED.profile_text,
-                keywords = EXCLUDED.keywords,
-                excluded = EXCLUDED.excluded,
-                target_roles = EXCLUDED.target_roles,
-                target_tech = EXCLUDED.target_tech,
-                target_contracts = EXCLUDED.target_contracts,
-                target_locations = EXCLUDED.target_locations,
-                search_queries = EXCLUDED.search_queries,
-                updated_at = NOW()
-            """,
-            profile.master_cv[:500],  # Profile matching text (derived from CV summary)
-            profile.target_tech,
-            excluded,
-            profile.target_roles,
-            profile.target_tech,
-            profile.target_contracts,
-            profile.target_locations,
-            search_queries
-        )
+        if uid:
+            existing_id = await conn.fetchval("SELECT id FROM profile WHERE user_id = $1", uid)
+            if existing_id:
+                await conn.execute(
+                    """
+                    UPDATE profile SET profile_text=$1, keywords=$2, excluded=$3, min_score=0.75,
+                        target_roles=$4, target_tech=$5, target_contracts=$6, target_locations=$7,
+                        search_queries=$8, updated_at=NOW()
+                    WHERE user_id=$9
+                    """,
+                    profile.master_cv[:2000], profile_tech, excluded,
+                    profile.target_roles, profile_tech, profile.target_contracts,
+                    profile.target_locations, search_queries, uid
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO profile (profile_text, keywords, excluded, min_score,
+                        target_roles, target_tech, target_contracts, target_locations, search_queries, user_id, updated_at)
+                    VALUES ($1, $2, $3, 0.75, $4, $5, $6, $7, $8, $9, NOW())
+                    """,
+                    profile.master_cv[:2000], profile_tech, excluded,
+                    profile.target_roles, profile_tech, profile.target_contracts,
+                    profile.target_locations, search_queries, uid
+                )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO profile (
+                    id, profile_text, keywords, excluded, min_score,
+                    target_roles, target_tech, target_contracts, target_locations, search_queries, updated_at
+                ) VALUES (1, $1, $2, $3, 0.75, $4, $5, $6, $7, $8, NOW())
+                ON CONFLICT (id) DO UPDATE
+                SET profile_text = EXCLUDED.profile_text,
+                    keywords = EXCLUDED.keywords,
+                    excluded = EXCLUDED.excluded,
+                    target_roles = EXCLUDED.target_roles,
+                    target_tech = EXCLUDED.target_tech,
+                    target_contracts = EXCLUDED.target_contracts,
+                    target_locations = EXCLUDED.target_locations,
+                    search_queries = EXCLUDED.search_queries,
+                    updated_at = NOW()
+                """,
+                profile.master_cv[:2000], profile_tech, excluded,
+                profile.target_roles, profile_tech, profile.target_contracts,
+                profile.target_locations, search_queries
+            )
         
     return {
         "message": "Master profile and matching preferences successfully updated.",
@@ -396,13 +554,36 @@ async def save_profile(
     }
 
 # --- AI Materials Generation Endpoints ---
-@app.post("/api/jobs/{job_id}/materials")
-async def generate_application_materials(
-    job_id: str, 
-    selected_feat_ids: Optional[List[str]] = None,
+@app.post("/api/jobs/{job_id}/suggest-feats")
+async def suggest_feats_for_job(
+    job_id: str,
     user: Dict[str, Any] = Depends(get_current_user_from_cookie)
 ):
-    """Asynchronously tailor CV and cover letter using selected feats and Gemini API."""
+    """Ask Gemini to rank the user's feats by relevance to this specific job."""
+    job = await db_client.get_job_by_id(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    all_feats = await db_client.get_feats()
+    if not all_feats:
+        return {"feats": []}
+
+    try:
+        generator = ApplicationMaterialGenerator(gemini_provider)
+        ranked = await generator.suggest_feats(all_feats, job)
+        return {"feats": ranked}
+    except Exception as e:
+        logger.error(f"suggest-feats error: {e}", exc_info=True)
+        # Fallback: return all feats unranked
+        return {"feats": [{**f, "suggested": True, "reason": ""} for f in all_feats]}
+
+@app.post("/api/jobs/{job_id}/materials")
+async def generate_application_materials(
+    job_id: str,
+    body: GenerateMaterialsSchema,
+    user: Dict[str, Any] = Depends(get_current_user_from_cookie)
+):
+    """Generate tailored CV, cover letter, and optional Q&A answers via Gemini."""
     job = await db_client.get_job_by_id(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found.")
@@ -412,31 +593,31 @@ async def generate_application_materials(
         raise HTTPException(status_code=400, detail="Master CV must be configured in Settings first.")
 
     all_feats = await db_client.get_feats()
-    feats_to_use = []
-    
-    if selected_feat_ids is not None:
-        feats_to_use = [f for f in all_feats if str(f["id"]) in selected_feat_ids]
+    if body.selected_feat_ids is not None:
+        feats_to_use = [f for f in all_feats if str(f["id"]) in body.selected_feat_ids]
     else:
-        job_stack = set([t.lower() for t in (job.get("tech_stack") or [])])
-        for feat in all_feats:
-            feat_tags = set([s.lower() for s in (feat.get("skills_used") or [])])
-            if job_stack.intersection(feat_tags):
-                feats_to_use.append(feat)
-        feats_to_use = feats_to_use[:5]
+        feats_to_use = all_feats[:6]
 
     try:
         generator = ApplicationMaterialGenerator(gemini_provider)
-        materials = await generator.generate(profile["master_cv"], feats_to_use, job)
-        
+        materials = await generator.generate(
+            base_cv=profile["master_cv"],
+            accomplishments=feats_to_use,
+            job=job,
+            application_questions=body.application_questions
+        )
+
         await db_client.save_materials(
             job_id=job_id,
             tailored_cv=materials["tailored_cv"],
-            cover_letter=materials["cover_letter"]
+            cover_letter=materials["cover_letter"],
+            qa_answers=materials.get("qa_answers")
         )
         return {
-            "message": "Materials tailored successfully.",
+            "message": "Materials generated successfully.",
             "tailored_cv": materials["tailored_cv"],
-            "cover_letter": materials["cover_letter"]
+            "cover_letter": materials["cover_letter"],
+            "qa_answers": materials.get("qa_answers"),
         }
     except Exception as e:
         logger.error(f"Error generating materials via Gemini: {e}", exc_info=True)
@@ -455,7 +636,66 @@ async def get_application_materials(
 
 @app.get("/api/jobs")
 async def get_all_jobs(
-    limit: int = 20
+    limit: int = 20,
+    user: Optional[Dict[str, Any]] = Depends(get_optional_user_from_cookie)
 ):
-    """Fetch ranked jobs list ordered by score."""
-    return await db_client.get_jobs(limit)
+    """Fetch ranked jobs list. Returns per-user scores when authenticated, global scores otherwise."""
+    user_id = user.get("user_id") if user else None
+    jobs = await db_client.get_jobs(limit, user_id=user_id)
+    return {"jobs": jobs}
+
+@app.post("/api/rescore")
+async def rescore_existing_jobs(
+    background_tasks: BackgroundTasks,
+    limit: int = 100,
+    user: Dict[str, Any] = Depends(get_current_user_from_cookie)
+):
+    """Recalculate scores for all stored jobs against the requesting user's profile."""
+    user_id = user.get("user_id") if user else None
+    background_tasks.add_task(_rescore_jobs_background, limit, user_id)
+    return {"message": f"Rescore scheduled for up to {limit} jobs. Running in background."}
+
+
+async def _rescore_jobs_background(limit: int, user_id: Optional[str] = None):
+    """Background worker: re-embeds and rescores stored jobs for a specific user."""
+    profile = await db_client.get_profile(user_id)
+    if not profile:
+        logger.error("Rescore aborted: no profile configured.")
+        return
+
+    profile_text = profile.get("profile_text", "")
+    logger.info(f"Rescore: fetching profile embedding (user={user_id})...")
+    profile_embedding = await gemini_embedder.get_embedding(profile_text)
+
+    async with db_client.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM jobs ORDER BY scraped_at DESC LIMIT $1", limit
+        )
+
+    logger.info(f"Rescore: scoring {len(rows)} jobs for user={user_id}...")
+    rescored = 0
+    for row in rows:
+        job = dict(row)
+        try:
+            scores = await composite_scorer.score_job(
+                description=job.get("description", ""),
+                posted_at=job.get("posted_at"),
+                profile_text=profile_text,
+                profile_embedding=profile_embedding,
+                keywords=profile.get("keywords", []),
+                excluded=profile.get("excluded", []),
+                contract_type=job.get("contract_type"),
+                location=job.get("location"),
+                target_contracts=profile.get("target_contracts", []),
+                target_locations=profile.get("target_locations", [])
+            )
+            await db_client.update_job_scores(str(job["id"]), scores, user_id)
+            rescored += 1
+            logger.info(
+                f"Rescored [{rescored}/{len(rows)}]: {job.get('title','?')[:50]} "
+                f"— composite={scores['composite']:.2f} semantic={scores['semantic']:.2f}"
+            )
+        except Exception as e:
+            logger.error(f"Rescore failed for job {job.get('id')}: {e}", exc_info=True)
+
+    logger.info(f"Rescore complete: {rescored}/{len(rows)} jobs updated.")
