@@ -517,8 +517,9 @@ async def parse_cv_file(
 # --- User Profile & Onboarding Settings Endpoints ---
 @app.get("/api/profile")
 async def get_profile(user: Optional[Dict[str, Any]] = Depends(get_optional_user_from_cookie)):
-    profile = await db_client.get_user_profile()
+    user_email = user.get("sub") if user else None
     user_id = user.get("user_id") if user else None
+    profile = await db_client.get_user_profile(user_email)
     matching_criteria = await db_client.get_profile(user_id)
     return {
         "profile": profile,
@@ -649,7 +650,8 @@ async def generate_application_materials(
     if not job:
         raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found.")
 
-    profile = await db_client.get_user_profile()
+    user_email = user.get("sub")
+    profile = await db_client.get_user_profile(user_email)
     if not profile or not profile.get("master_cv"):
         raise HTTPException(status_code=400, detail="Master CV must be configured in Settings first.")
 

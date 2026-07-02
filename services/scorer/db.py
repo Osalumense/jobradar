@@ -28,7 +28,7 @@ class DatabaseClient:
             self.pool = None
 
     async def get_profile(self, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Fetch the matching target profile for a user (falls back to id=1 if no user_id)."""
+        """Fetch the matching target profile for a user."""
         if not self.pool:
             await self.connect()
 
@@ -37,8 +37,8 @@ class DatabaseClient:
                 row = await conn.fetchrow("SELECT * FROM profile WHERE user_id = $1 LIMIT 1", user_id)
                 if row:
                     return dict(row)
-            # Fallback to legacy singleton row
-            row = await conn.fetchrow("SELECT * FROM profile WHERE id = 1 LIMIT 1")
+            # Fallback: return any row (single-user legacy or anonymous)
+            row = await conn.fetchrow("SELECT * FROM profile WHERE user_id IS NULL LIMIT 1")
             return dict(row) if row else None
 
     async def save_profile(self, profile_text: str, keywords: List[str], excluded: List[str], min_score: float, user_id: Optional[str] = None) -> None:
@@ -66,19 +66,17 @@ class DatabaseClient:
                         profile_text, keywords, excluded, min_score, user_id
                     )
             else:
-                await conn.execute(
-                    """
-                    INSERT INTO profile (id, profile_text, keywords, excluded, min_score, updated_at)
-                    VALUES (1, $1, $2, $3, $4, NOW())
-                    ON CONFLICT (id) DO UPDATE
-                    SET profile_text = EXCLUDED.profile_text,
-                        keywords = EXCLUDED.keywords,
-                        excluded = EXCLUDED.excluded,
-                        min_score = EXCLUDED.min_score,
-                        updated_at = NOW()
-                    """,
-                    profile_text, keywords, excluded, min_score
-                )
+                anon_id = await conn.fetchval("SELECT id FROM profile WHERE user_id IS NULL LIMIT 1")
+                if anon_id:
+                    await conn.execute(
+                        "UPDATE profile SET profile_text=$1, keywords=$2, excluded=$3, min_score=$4, updated_at=NOW() WHERE id=$5",
+                        profile_text, keywords, excluded, min_score, anon_id
+                    )
+                else:
+                    await conn.execute(
+                        "INSERT INTO profile (profile_text, keywords, excluded, min_score, updated_at) VALUES ($1, $2, $3, $4, NOW())",
+                        profile_text, keywords, excluded, min_score
+                    )
 
     async def insert_job(self, job: Dict[str, Any]) -> str:
         """Insert or update a scraped job, returning its database UUID."""
@@ -235,29 +233,31 @@ class DatabaseClient:
                 job_id, tailored_cv, cover_letter, qa_answers
             )
 
-    async def get_user_profile(self) -> Optional[Dict[str, Any]]:
-        """Retrieve master user profile containing base CV."""
+    async def get_user_profile(self, email: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieve master user profile containing base CV, scoped by email."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
-            # Get first profile row if exists
-            row = await conn.fetchrow("SELECT * FROM user_profiles LIMIT 1")
+            if email:
+                row = await conn.fetchrow("SELECT * FROM user_profiles WHERE email = $1 LIMIT 1", email)
+            else:
+                row = await conn.fetchrow("SELECT * FROM user_profiles LIMIT 1")
             return dict(row) if row else None
 
     async def save_user_profile(self, name: str, email: str, phone: str | None, github: str | None, linkedin: str | None, master_cv: str) -> None:
-        """Save/update the master user profile."""
+        """Save/update the master user profile, scoped by email."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
-            # Check if profile already exists
-            existing = await conn.fetchval("SELECT COUNT(*) FROM user_profiles")
-            if existing > 0:
+            existing = await conn.fetchval("SELECT id FROM user_profiles WHERE email = $1", email)
+            if existing:
                 await conn.execute(
                     """
                     UPDATE user_profiles
-                    SET full_name = $1, email = $2, phone = $3, github_url = $4, linkedin_url = $5, master_cv = $6, updated_at = NOW()
+                    SET full_name=$1, phone=$2, github_url=$3, linkedin_url=$4, master_cv=$5, updated_at=NOW()
+                    WHERE email=$6
                     """,
-                    name, email, phone, github, linkedin, master_cv
+                    name, phone, github, linkedin, master_cv, email
                 )
             else:
                 await conn.execute(
