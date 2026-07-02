@@ -2,7 +2,7 @@ import os
 import httpx
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Response, Request, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Response, Request, status, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -457,6 +457,63 @@ async def delete_feat(feat_id: str, user: Dict[str, Any] = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Feat not found")
     return {"message": "Accomplishment deleted."}
 
+# --- CV File Parsing Endpoint ---
+@app.post("/api/profile/parse-cv")
+async def parse_cv_file(
+    file: UploadFile,
+    user: Dict[str, Any] = Depends(get_current_user_from_cookie)
+):
+    """Extract plain text from an uploaded CV file (PDF, DOCX, or TXT)."""
+    filename = (file.filename or "").lower()
+    content = await file.read()
+
+    try:
+        if filename.endswith(".pdf"):
+            import io, re
+            import pdfplumber
+            pages_text = []
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                for page in pdf.pages:
+                    words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
+                    if not words:
+                        continue
+                    # Reconstruct lines by grouping words with similar y-coordinate,
+                    # then sort lines top-to-bottom. This handles any column layout.
+                    LINE_TOLERANCE = 5  # px — words within this y-range are on the same line
+                    lines: dict[int, list] = {}
+                    for w in words:
+                        y_bucket = round(w["top"] / LINE_TOLERANCE) * LINE_TOLERANCE
+                        lines.setdefault(y_bucket, []).append(w)
+                    page_lines = []
+                    for y in sorted(lines):
+                        line_words = sorted(lines[y], key=lambda w: w["x0"])
+                        page_lines.append(" ".join(w["text"] for w in line_words))
+                    pages_text.append("\n".join(page_lines))
+
+            text = "\n\n".join(pages_text)
+            # Collapse any remaining multi-space runs; preserve newlines
+            text = re.sub(r'[ \t]{2,}', ' ', text)
+            text = re.sub(r'\n{3,}', '\n\n', text)
+        elif filename.endswith(".docx"):
+            import io
+            from docx import Document
+            doc = Document(io.BytesIO(content))
+            text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        elif filename.endswith((".txt", ".md")):
+            text = content.decode("utf-8", errors="replace")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF, DOCX, TXT, or MD file.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not read file: {str(e)}")
+
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="No text could be extracted from this file.")
+
+    return {"text": text, "chars": len(text)}
+
 # --- User Profile & Onboarding Settings Endpoints ---
 @app.get("/api/profile")
 async def get_profile(user: Optional[Dict[str, Any]] = Depends(get_optional_user_from_cookie)):
@@ -526,27 +583,31 @@ async def save_profile(
                     profile.target_locations, search_queries, uid
                 )
         else:
-            await conn.execute(
-                """
-                INSERT INTO profile (
-                    id, profile_text, keywords, excluded, min_score,
-                    target_roles, target_tech, target_contracts, target_locations, search_queries, updated_at
-                ) VALUES (1, $1, $2, $3, 0.75, $4, $5, $6, $7, $8, NOW())
-                ON CONFLICT (id) DO UPDATE
-                SET profile_text = EXCLUDED.profile_text,
-                    keywords = EXCLUDED.keywords,
-                    excluded = EXCLUDED.excluded,
-                    target_roles = EXCLUDED.target_roles,
-                    target_tech = EXCLUDED.target_tech,
-                    target_contracts = EXCLUDED.target_contracts,
-                    target_locations = EXCLUDED.target_locations,
-                    search_queries = EXCLUDED.search_queries,
-                    updated_at = NOW()
-                """,
-                profile.master_cv[:2000], profile_tech, excluded,
-                profile.target_roles, profile_tech, profile.target_contracts,
-                profile.target_locations, search_queries
-            )
+            # Fallback: unauthenticated or missing user_id — upsert against user_id IS NULL row
+            anon_id = await conn.fetchval("SELECT id FROM profile WHERE user_id IS NULL LIMIT 1")
+            if anon_id:
+                await conn.execute(
+                    """
+                    UPDATE profile SET profile_text=$1, keywords=$2, excluded=$3, min_score=0.75,
+                        target_roles=$4, target_tech=$5, target_contracts=$6, target_locations=$7,
+                        search_queries=$8, updated_at=NOW()
+                    WHERE id=$9
+                    """,
+                    profile.master_cv[:2000], profile_tech, excluded,
+                    profile.target_roles, profile_tech, profile.target_contracts,
+                    profile.target_locations, search_queries, anon_id
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO profile (profile_text, keywords, excluded, min_score,
+                        target_roles, target_tech, target_contracts, target_locations, search_queries, updated_at)
+                    VALUES ($1, $2, $3, 0.75, $4, $5, $6, $7, $8, NOW())
+                    """,
+                    profile.master_cv[:2000], profile_tech, excluded,
+                    profile.target_roles, profile_tech, profile.target_contracts,
+                    profile.target_locations, search_queries
+                )
         
     return {
         "message": "Master profile and matching preferences successfully updated.",

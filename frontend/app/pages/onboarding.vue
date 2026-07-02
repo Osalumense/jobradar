@@ -38,19 +38,43 @@
         </div>
       </div>
 
-      <!-- Step 2: CV paste -->
+      <!-- Step 2: CV upload -->
       <div v-if="step === 2" class="ob-step">
-        <h2>Paste your CV</h2>
-        <p class="ob-hint">We use this to generate your semantic profile embedding — the more detail, the better your matches. Markdown or plain text both work.</p>
+        <h2>Your CV</h2>
+        <p class="ob-hint">We extract the text to build your semantic profile. Supports PDF, Word (.docx), or plain text.</p>
+
+        <!-- Upload zone -->
+        <label class="upload-zone" :class="{ 'has-file': cvFileName, 'uploading': cvUploading }">
+          <input type="file" accept=".pdf,.docx,.txt,.md" class="file-input" @change="handleCVUpload" />
+          <template v-if="cvUploading">
+            <span class="spinner" style="width:22px;height:22px;border-width:3px" />
+            <span class="upload-label">Extracting text…</span>
+          </template>
+          <template v-else-if="cvFileName">
+            <svg viewBox="0 0 24 24" class="upload-icon success-icon"><polyline points="20 6 9 17 4 12"/></svg>
+            <span class="upload-label">{{ cvFileName }}</span>
+            <span class="upload-sub">Click to replace</span>
+          </template>
+          <template v-else>
+            <svg viewBox="0 0 24 24" class="upload-icon"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            <span class="upload-label">Click to upload your CV</span>
+            <span class="upload-sub">PDF, DOCX, TXT — or paste below</span>
+          </template>
+        </label>
+
+        <p v-if="cvUploadError" class="upload-error">{{ cvUploadError }}</p>
+
+        <div class="cv-divider"><span>or paste text manually</span></div>
+
         <textarea
           v-model="form.master_cv"
           class="cv-area"
           placeholder="## Stephen Akugbe&#10;Backend Engineer, Python, Node.js, FastAPI…&#10;&#10;## Experience&#10;…"
-          rows="14"
+          rows="8"
         />
         <div class="char-count" :class="{ good: form.master_cv.length >= 500 }">
           {{ form.master_cv.length }} chars
-          <span v-if="form.master_cv.length < 300" class="char-hint">(aim for 500+ for best results)</span>
+          <span v-if="form.master_cv.length < 300" class="char-hint">(aim for 500+)</span>
         </div>
       </div>
 
@@ -161,6 +185,36 @@ const step = ref(1)
 const totalSteps = 5
 const saving = ref(false)
 const error = ref('')
+const cvFileName = ref('')
+const cvUploading = ref(false)
+const cvUploadError = ref('')
+
+const handleCVUpload = async (e: Event) => {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  cvUploadError.value = ''
+  cvUploading.value = true
+  try {
+    const fd = new FormData()
+    fd.append('file', file)
+    const res = await fetch(`${api}/api/profile/parse-cv`, {
+      method: 'POST',
+      credentials: 'include',
+      body: fd,
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || 'Could not read file')
+    }
+    const data = await res.json()
+    form.master_cv = data.text
+    cvFileName.value = file.name
+  } catch (e: any) {
+    cvUploadError.value = e.message || 'Upload failed. Try pasting your CV text instead.'
+  } finally {
+    cvUploading.value = false
+  }
+}
 
 const form = reactive({
   full_name: '',
@@ -234,6 +288,9 @@ const finish = async () => {
         target_locations: parsedLocations.value,
       })
     })
+    // Mark onboarding complete so middleware doesn't redirect back
+    const onboardingDone = useState<boolean | null>('onboarding.done')
+    onboardingDone.value = true
     await navigateTo('/')
   } catch (e: any) {
     error.value = 'Failed to save profile. Please try again.'
@@ -350,4 +407,34 @@ textarea { resize: vertical; line-height: 1.6; }
   border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* CV upload */
+.file-input { display: none; }
+
+.upload-zone {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0.5rem; padding: 2rem 1.5rem;
+  border: 2px dashed rgba(255,255,255,0.1); border-radius: 12px;
+  background: rgba(255,255,255,0.02); transition: all 0.2s; text-align: center;
+  cursor: pointer;
+}
+.upload-zone:hover { border-color: rgba(16,185,129,0.4); background: rgba(16,185,129,0.04); }
+.upload-zone.has-file { border-color: rgba(16,185,129,0.35); border-style: solid; background: rgba(16,185,129,0.06); }
+.upload-zone.uploading { pointer-events: none; opacity: 0.7; }
+
+.upload-icon {
+  width: 28px; height: 28px; stroke: #475569; fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.success-icon { stroke: #10b981; }
+.upload-label { font-size: 0.9rem; font-weight: 500; color: #cbd5e1; }
+.upload-zone.has-file .upload-label { color: #10b981; }
+.upload-sub { font-size: 0.78rem; color: #475569; }
+.upload-error { font-size: 0.82rem; color: #f87171; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); border-radius: 8px; padding: 0.5rem 0.75rem; }
+
+.cv-divider {
+  display: flex; align-items: center; gap: 0.75rem;
+  color: #334155; font-size: 0.75rem;
+}
+.cv-divider::before, .cv-divider::after { content: ''; flex: 1; height: 1px; background: rgba(255,255,255,0.06); }
 </style>
