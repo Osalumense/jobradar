@@ -702,12 +702,14 @@ async def get_application_materials(
 @app.get("/api/jobs")
 async def get_all_jobs(
     limit: int = 20,
+    offset: int = 0,
     user: Optional[Dict[str, Any]] = Depends(get_optional_user_from_cookie)
 ):
-    """Fetch ranked jobs list. Returns per-user scores when authenticated, global scores otherwise."""
+    """Fetch ranked jobs list with pagination. Returns per-user scores when authenticated."""
     user_id = user.get("user_id") if user else None
-    jobs = await db_client.get_jobs(limit, user_id=user_id)
-    return {"jobs": jobs}
+    jobs = await db_client.get_jobs(limit, offset=offset, user_id=user_id)
+    total = await db_client.count_jobs()
+    return {"jobs": jobs, "total": total, "offset": offset, "limit": limit}
 
 @app.post("/api/rescore")
 async def rescore_existing_jobs(

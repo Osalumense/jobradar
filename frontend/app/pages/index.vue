@@ -59,7 +59,7 @@
           <button class="btn-refresh" @click="fetchJobs">Refresh</button>
         </div>
 
-        <div v-if="loading" class="loading-feed">
+        <div v-if="loading && jobs.length === 0" class="loading-feed">
           <div v-for="i in 4" :key="i" class="skeleton-card" />
         </div>
 
@@ -92,7 +92,20 @@
             </div>
           </div>
 
-          <div v-if="filteredJobs.length === 0" class="empty-feed">
+          <!-- Pagination -->
+          <div class="load-more-row">
+            <div v-if="loadingMore" class="loading-more">
+              <span class="spinner-sm" /> Loading more jobs…
+            </div>
+            <button v-else-if="!allLoaded && jobs.length > 0" class="btn-load-more" @click="loadMore">
+              Load more <span class="load-more-count">({{ jobs.length }} / {{ total }})</span>
+            </button>
+            <div v-else-if="allLoaded && jobs.length > 0" class="all-loaded">
+              All {{ total }} jobs loaded
+            </div>
+          </div>
+
+          <div v-if="filteredJobs.length === 0 && !loading" class="empty-feed">
             <svg viewBox="0 0 24 24" width="40" height="40"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
             <p>No jobs yet — click <strong>Scan Now</strong> to fetch from all sources.</p>
           </div>
@@ -216,7 +229,13 @@ const firstName = computed(() => {
   return name.charAt(0).toUpperCase() + name.slice(1)
 })
 
+const PAGE_SIZE = 20
+
 const jobs = ref<any[]>([])
+const total = ref(0)
+const offset = ref(0)
+const loadingMore = ref(false)
+const allLoaded = ref(false)
 const searchQueries = ref<string[]>([])
 const loading = ref(true)
 const scanning = ref(false)
@@ -292,21 +311,38 @@ const matching = ref(false)
 
 const fetchJobs = async () => {
   loading.value = true
+  offset.value = 0
+  allLoaded.value = false
   try {
-    const data = await get('/api/jobs?limit=200')
-    jobs.value = data.jobs ?? data
+    const data = await get(`/api/jobs?limit=${PAGE_SIZE}&offset=0`)
+    jobs.value = data.jobs ?? []
+    total.value = data.total ?? 0
+    allLoaded.value = jobs.value.length >= total.value
   } catch {}
   loading.value = false
 }
 
+const loadMore = async () => {
+  if (loadingMore.value || allLoaded.value) return
+  loadingMore.value = true
+  try {
+    const nextOffset = offset.value + PAGE_SIZE
+    const data = await get(`/api/jobs?limit=${PAGE_SIZE}&offset=${nextOffset}`)
+    const newJobs = data.jobs ?? []
+    jobs.value = [...jobs.value, ...newJobs]
+    offset.value = nextOffset
+    total.value = data.total ?? total.value
+    allLoaded.value = jobs.value.length >= total.value
+  } catch {}
+  loadingMore.value = false
+}
+
 const autoMatchIfNeeded = async () => {
-  // If all jobs have null composite_score, user has no scores yet — trigger rescore
   const hasScores = jobs.value.some(j => j.composite_score != null)
   if (!hasScores && jobs.value.length > 0) {
     matching.value = true
     try {
       await post('/api/rescore?limit=100')
-      // Poll until scores appear
       let attempts = 0
       const iv = setInterval(async () => {
         await fetchJobs()
@@ -333,16 +369,14 @@ const triggerScraper = async () => {
   scanning.value = true
   try {
     await post('/api/scrape')
-    const prevCount = jobs.value.length
+    const prevTotal = total.value
     let attempts = 0
     const iv = setInterval(async () => {
       await fetchJobs()
       attempts++
-      // Stop after 20 attempts (~3 min) or when new jobs appear
-      if (jobs.value.length > prevCount || attempts >= 20) {
+      if (total.value > prevTotal || attempts >= 20) {
         clearInterval(iv)
         scanning.value = false
-        await fetchJobs() // final refresh
       }
     }, 9000)
   } catch { scanning.value = false }
@@ -356,7 +390,11 @@ const doRescore = async () => {
   } catch { rescoring.value = false }
 }
 
-onMounted(async () => { await fetchJobs(); fetchProfile(); autoMatchIfNeeded() })
+onMounted(async () => {
+  await fetchJobs()
+  fetchProfile()
+  autoMatchIfNeeded()
+})
 </script>
 
 <style scoped>
@@ -437,6 +475,16 @@ onMounted(async () => { await fetchJobs(); fetchProfile(); autoMatchIfNeeded() }
 
 /* Skeletons */
 .loading-feed { display: flex; flex-direction: column; gap: 0.75rem; }
+.load-more-row { padding: 1.5rem 0; display: flex; justify-content: center; }
+.loading-more { display: flex; align-items: center; gap: 0.5rem; color: #64748b; font-size: 0.85rem; }
+.all-loaded { color: #374151; font-size: 0.8rem; }
+.btn-load-more {
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+  color: #94a3b8; border-radius: 10px; padding: 0.6rem 1.5rem;
+  font-size: 0.875rem; transition: all 0.15s;
+}
+.btn-load-more:hover { background: rgba(255,255,255,0.09); color: #e2e8f0; border-color: rgba(255,255,255,0.18); }
+.load-more-count { color: #475569; font-size: 0.8rem; }
 .matching-banner {
   display: flex; align-items: center; gap: 0.75rem;
   background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.2);

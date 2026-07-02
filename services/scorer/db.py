@@ -276,8 +276,15 @@ class DatabaseClient:
                     name, email, phone, github, linkedin, master_cv
                 )
 
-    async def get_jobs(self, limit: int = 20, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch scraped jobs with scores. If user_id, merges per-user scores from job_scores."""
+    async def count_jobs(self) -> int:
+        """Return total number of scraped jobs."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval("SELECT COUNT(*) FROM jobs")
+
+    async def get_jobs(self, limit: int = 20, offset: int = 0, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch scraped jobs with scores and pagination support."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
@@ -292,16 +299,16 @@ class DatabaseClient:
                            COALESCE(js.tech_stack, j.tech_stack) AS tech_stack,
                            js.scored_at, js.alerted
                     FROM jobs j
-                    LEFT JOIN job_scores js ON js.job_id = j.id AND js.user_id = $2
+                    LEFT JOIN job_scores js ON js.job_id = j.id AND js.user_id = $3
                     ORDER BY js.composite_score DESC NULLS LAST, j.scraped_at DESC
-                    LIMIT $1
+                    LIMIT $1 OFFSET $2
                     """,
-                    limit, user_id
+                    limit, offset, user_id
                 )
             else:
                 rows = await conn.fetch(
-                    "SELECT * FROM jobs ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT $1",
-                    limit
+                    "SELECT * FROM jobs ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT $1 OFFSET $2",
+                    limit, offset
                 )
             return [dict(r) for r in rows]
 
