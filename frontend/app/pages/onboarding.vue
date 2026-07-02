@@ -288,6 +288,9 @@ const finish = async () => {
         target_locations: parsedLocations.value,
       })
     })
+    // Kick off background rescore so dashboard shows jobs ranked for this user's profile
+    fetch(`${api}/api/rescore?limit=100`, { method: 'POST', credentials: 'include' }).catch(() => {})
+
     // Mark onboarding complete so middleware doesn't redirect back
     const onboardingDone = useState<boolean | null>('onboarding.done')
     onboardingDone.value = true

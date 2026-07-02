@@ -53,6 +53,12 @@
           </div>
         </div>
 
+        <div v-if="matching" class="matching-banner">
+          <span class="spinner-sm" />
+          Matching jobs to your profile… this takes about a minute.
+          <button class="btn-refresh" @click="fetchJobs">Refresh</button>
+        </div>
+
         <div v-if="loading" class="loading-feed">
           <div v-for="i in 4" :key="i" class="skeleton-card" />
         </div>
@@ -282,6 +288,8 @@ const formatDesc = (txt: string) =>
 
 const openJob = (job: any) => { activeJob.value = job }
 
+const matching = ref(false)
+
 const fetchJobs = async () => {
   loading.value = true
   try {
@@ -289,6 +297,29 @@ const fetchJobs = async () => {
     jobs.value = data.jobs ?? data
   } catch {}
   loading.value = false
+}
+
+const autoMatchIfNeeded = async () => {
+  // If all jobs have null composite_score, user has no scores yet — trigger rescore
+  const hasScores = jobs.value.some(j => j.composite_score != null)
+  if (!hasScores && jobs.value.length > 0) {
+    matching.value = true
+    try {
+      await post('/api/rescore?limit=100')
+      // Poll until scores appear
+      let attempts = 0
+      const iv = setInterval(async () => {
+        await fetchJobs()
+        const done = jobs.value.some(j => j.composite_score != null)
+        if (done || ++attempts >= 12) {
+          clearInterval(iv)
+          matching.value = false
+        }
+      }, 8000)
+    } catch {
+      matching.value = false
+    }
+  }
 }
 
 const fetchProfile = async () => {
@@ -318,7 +349,7 @@ const doRescore = async () => {
   } catch { rescoring.value = false }
 }
 
-onMounted(() => { fetchJobs(); fetchProfile() })
+onMounted(async () => { await fetchJobs(); fetchProfile(); autoMatchIfNeeded() })
 </script>
 
 <style scoped>
@@ -399,6 +430,19 @@ onMounted(() => { fetchJobs(); fetchProfile() })
 
 /* Skeletons */
 .loading-feed { display: flex; flex-direction: column; gap: 0.75rem; }
+.matching-banner {
+  display: flex; align-items: center; gap: 0.75rem;
+  background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.2);
+  border-radius: 10px; padding: 0.75rem 1rem;
+  font-size: 0.875rem; color: #6ee7b7; margin-bottom: 0.5rem;
+}
+.btn-refresh {
+  margin-left: auto; background: none; border: 1px solid rgba(16,185,129,0.4);
+  color: #6ee7b7; border-radius: 6px; padding: 0.25rem 0.6rem;
+  font-size: 0.8rem;
+}
+.btn-refresh:hover { background: rgba(16,185,129,0.1); }
+
 .skeleton-card {
   height: 88px; border-radius: 14px;
   background: linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0.03) 75%);
