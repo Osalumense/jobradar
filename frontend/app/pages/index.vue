@@ -293,7 +293,7 @@ const matching = ref(false)
 const fetchJobs = async () => {
   loading.value = true
   try {
-    const data = await get('/api/jobs?limit=50')
+    const data = await get('/api/jobs?limit=200')
     jobs.value = data.jobs ?? data
   } catch {}
   loading.value = false
@@ -333,11 +333,18 @@ const triggerScraper = async () => {
   scanning.value = true
   try {
     await post('/api/scrape')
+    const prevCount = jobs.value.length
     let attempts = 0
     const iv = setInterval(async () => {
       await fetchJobs()
-      if (++attempts >= 6) { clearInterval(iv); scanning.value = false }
-    }, 8000)
+      attempts++
+      // Stop after 20 attempts (~3 min) or when new jobs appear
+      if (jobs.value.length > prevCount || attempts >= 20) {
+        clearInterval(iv)
+        scanning.value = false
+        await fetchJobs() // final refresh
+      }
+    }, 9000)
   } catch { scanning.value = false }
 }
 
