@@ -209,22 +209,31 @@ async def compile_search_queries(
 
 # --- Background Worker Trigger helper ---
 async def run_scraper_and_consume(user_id: Optional[str] = None):
-    """Runs all scrapers, enqueues raw jobs, and starts processing for a user."""
-    profile = await db_client.get_profile(user_id)
-    search_queries = []
-    if profile and profile.get("search_queries"):
-        search_queries = profile.get("search_queries")
-    
-    if not search_queries:
-        if profile:
-            search_queries = build_search_queries(
-                profile.get("target_roles", []),
-                profile.get("target_tech", []),
-                profile.get("target_contracts", []),
-                profile.get("target_locations", []),
+    """Scrape jobs using ALL users' combined queries, then rescore for every user."""
+    # Collect search queries from every user profile — global scrape pool
+    all_profiles = await db_client.get_all_profiles()
+    seen_queries: set = set()
+    search_queries: list = []
+
+    for p in all_profiles:
+        qs = p.get("search_queries") or []
+        if not qs:
+            qs = build_search_queries(
+                p.get("target_roles", []),
+                p.get("target_tech", []),
+                p.get("target_contracts", []),
+                p.get("target_locations", []),
             )
-        else:
-            search_queries = GENERIC_SEARCH_QUERIES
+        for q in qs:
+            q_norm = q.strip().lower()
+            if q_norm not in seen_queries:
+                seen_queries.add(q_norm)
+                search_queries.append(q)
+
+    if not search_queries:
+        search_queries = GENERIC_SEARCH_QUERIES
+
+    logger.info(f"Scraping with {len(search_queries)} deduplicated queries from {len(all_profiles)} user profiles")
 
     scrapers = [
         WelcomeToTheJungleScraper(),
@@ -233,59 +242,52 @@ async def run_scraper_and_consume(user_id: Optional[str] = None):
         LesJeudiscraper(),
         RemotiveScraper(),
     ]
-    
-    # Process queries for Remotive (needs clean keywords without French prepositions/stopwords)
-    cleaned_queries = []
-    for q in search_queries:
-        kw_list = []
-        for word in q.split():
-            w = word.lower().strip()
-            if w not in ["alternance", "cdi", "stage", "cdd", "paris", "développeur", "ingénieur", "france", "ile-de-france"]:
-                kw_list.append(w)
-        cleaned_queries.append(" ".join(kw_list) if kw_list else "developer")
+
+    # Remotive needs clean English keywords
+    stopwords = {"alternance", "cdi", "stage", "cdd", "paris", "développeur", "ingénieur", "france", "ile-de-france"}
+    cleaned_queries = list({
+        " ".join(w for w in q.split() if w.lower() not in stopwords) or "developer"
+        for q in search_queries
+    })
 
     started_at = datetime.utcnow()
     total_enqueued = 0
     async with httpx.AsyncClient() as client:
         for scraper in scrapers:
-            if scraper.source == "remotive":
-                scraper.search_queries = list(set(cleaned_queries))
-            else:
-                scraper.search_queries = search_queries
-
+            scraper.search_queries = cleaned_queries if scraper.source == "remotive" else search_queries
             run_id = await db_client.log_scrape_run(scraper.source, started_at)
             try:
                 raw_jobs = await scraper.run()
                 new_jobs_count = 0
                 for job in raw_jobs:
-                    is_duplicate = await job_queue.is_seen(client, job.content_hash)
-                    if not is_duplicate:
+                    if not await job_queue.is_seen(client, job.content_hash):
                         await job_queue.enqueue(client, job.to_dict())
                         new_jobs_count += 1
-
                 total_enqueued += new_jobs_count
-                logger.info(
-                    f"Scraper '{scraper.source}' done: {len(raw_jobs)} fetched, "
-                    f"{new_jobs_count} new, {len(raw_jobs) - new_jobs_count} duplicates"
-                )
-
+                logger.info(f"Scraper '{scraper.source}': {len(raw_jobs)} fetched, {new_jobs_count} new")
                 async with db_client.pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE scrape_runs SET finished_at = NOW(), jobs_found = $1, jobs_new = $2 WHERE id = $3",
+                        "UPDATE scrape_runs SET finished_at=NOW(), jobs_found=$1, jobs_new=$2 WHERE id=$3",
                         len(raw_jobs), new_jobs_count, run_id
                     )
             except Exception as e:
                 logger.error(f"Scraper error for {scraper.source}: {e}", exc_info=True)
                 async with db_client.pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE scrape_runs SET finished_at = NOW(), error = $1 WHERE id = $2",
-                        str(e), run_id
+                        "UPDATE scrape_runs SET finished_at=NOW(), error=$1 WHERE id=$2", str(e), run_id
                     )
 
-        logger.info(f"All scrapers done. Total new jobs enqueued: {total_enqueued}")
-
-        # Trigger queue consumption for the requesting user
+        logger.info(f"All scrapers done. {total_enqueued} new jobs. Consuming queue...")
+        # Consume the queue (score + embed) for the triggering user first for fast feedback
         await consumer.consume_all(client, user_id=user_id)
+
+    # After scraping, rescore all other users in the background so everyone's feed updates
+    other_user_ids = [p["user_id"] for p in all_profiles if p.get("user_id") and p["user_id"] != user_id]
+    for uid in other_user_ids:
+        try:
+            await _rescore_jobs_background(limit=200, user_id=uid)
+        except Exception as e:
+            logger.error(f"Post-scrape rescore failed for user {uid}: {e}")
 
 
 # --- Authentication REST Endpoints ---

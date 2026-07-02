@@ -27,6 +27,14 @@ class DatabaseClient:
             await self.pool.close()
             self.pool = None
 
+    async def get_all_profiles(self) -> List[Dict[str, Any]]:
+        """Fetch all user profiles for global scrape + rescore."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM profile WHERE user_id IS NOT NULL")
+            return [dict(r) for r in rows]
+
     async def get_profile(self, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Fetch the matching target profile for a user."""
         if not self.pool:
