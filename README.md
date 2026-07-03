@@ -18,9 +18,6 @@ JobRadar AI is a self-hosted, AI-powered job search and application platform. It
 ### Application Pipeline
 ![Pipeline](docs/screenshots/pipeline.png)
 
-### Profile & Master CV
-![Profile](docs/screenshots/profile.png)
-
 ---
 
 ## Features
