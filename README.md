@@ -4,6 +4,25 @@ JobRadar AI is a self-hosted, AI-powered job search and application platform. It
 
 ---
 
+## Screenshots
+
+### Login
+![Login](docs/screenshots/login.png)
+
+### Dashboard — Job Feed
+![Dashboard](docs/screenshots/dashboard.png)
+
+### Dashboard — Alternance Filter
+![Dashboard Alternance Filter](docs/screenshots/dashboard_alternance.png)
+
+### Application Pipeline
+![Pipeline](docs/screenshots/pipeline.png)
+
+### Profile & Master CV
+![Profile](docs/screenshots/profile.png)
+
+---
+
 ## Features
 
 - **Multi-source scraping**: Welcome to the Jungle, HelloWork, France Travail, LesJeudis, and Remotive — running on every "Scan Now" trigger.
