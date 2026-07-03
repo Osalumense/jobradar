@@ -277,19 +277,18 @@ const pipelineCount = computed(() =>
   jobs.value.filter(j => j.status === pipelineFilter.value).length
 )
 
+// Filtering is server-side; filteredJobs is just jobs as returned by the API
 const filteredJobs = computed(() => {
-  return jobs.value.filter(j => {
-    if (sourceFilter.value && j.source !== sourceFilter.value) return false
-    if (locationFilter.value && !j.location?.toLowerCase().includes(locationFilter.value.toLowerCase())) return false
-    if (selectedContracts.value.length && !selectedContracts.value.includes(j.contract_type?.toLowerCase())) return false
-    return true
-  })
+  if (!locationFilter.value) return jobs.value
+  const loc = locationFilter.value.toLowerCase()
+  return jobs.value.filter(j => j.location?.toLowerCase().includes(loc))
 })
 
 const toggleContract = (v: string) => {
   const idx = selectedContracts.value.indexOf(v)
   if (idx >= 0) selectedContracts.value.splice(idx, 1)
   else selectedContracts.value.push(v)
+  fetchJobs()
 }
 
 const scoreClass = (s: number | null) => {
@@ -309,12 +308,21 @@ const openJob = (job: any) => { activeJob.value = job }
 
 const matching = ref(false)
 
+const buildJobsUrl = (pageOffset: number) => {
+  const params = new URLSearchParams()
+  params.set('limit', String(PAGE_SIZE))
+  params.set('offset', String(pageOffset))
+  if (selectedContracts.value.length === 1) params.set('contract_type', selectedContracts.value[0])
+  if (sourceFilter.value) params.set('source', sourceFilter.value)
+  return `/api/jobs?${params.toString()}`
+}
+
 const fetchJobs = async () => {
   loading.value = true
   offset.value = 0
   allLoaded.value = false
   try {
-    const data = await get(`/api/jobs?limit=${PAGE_SIZE}&offset=0`)
+    const data = await get(buildJobsUrl(0))
     jobs.value = data.jobs ?? []
     total.value = data.total ?? 0
     allLoaded.value = jobs.value.length >= total.value
@@ -327,7 +335,7 @@ const loadMore = async () => {
   loadingMore.value = true
   try {
     const nextOffset = offset.value + PAGE_SIZE
-    const data = await get(`/api/jobs?limit=${PAGE_SIZE}&offset=${nextOffset}`)
+    const data = await get(buildJobsUrl(nextOffset))
     const newJobs = data.jobs ?? []
     jobs.value = [...jobs.value, ...newJobs]
     offset.value = nextOffset
@@ -389,6 +397,8 @@ const doRescore = async () => {
     setTimeout(async () => { await fetchJobs(); rescoring.value = false }, 65000)
   } catch { rescoring.value = false }
 }
+
+watch(sourceFilter, () => fetchJobs())
 
 onMounted(async () => {
   await fetchJobs()

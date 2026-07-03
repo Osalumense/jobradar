@@ -276,21 +276,51 @@ class DatabaseClient:
                     name, email, phone, github, linkedin, master_cv
                 )
 
-    async def count_jobs(self) -> int:
-        """Return total number of scraped jobs."""
+    async def count_jobs(self, contract_type: Optional[str] = None, source: Optional[str] = None) -> int:
+        """Return total number of scraped jobs, optionally filtered."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
-            return await conn.fetchval("SELECT COUNT(*) FROM jobs")
+            where_clauses = []
+            args = []
+            if contract_type:
+                args.append(contract_type)
+                where_clauses.append(f"contract_type ILIKE ${ len(args) }")
+            if source:
+                args.append(source)
+                where_clauses.append(f"source = ${ len(args) }")
+            where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            return await conn.fetchval(f"SELECT COUNT(*) FROM jobs {where}", *args)
 
-    async def get_jobs(self, limit: int = 20, offset: int = 0, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch scraped jobs with scores and pagination support."""
+    async def get_jobs(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        user_id: Optional[str] = None,
+        contract_type: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch scraped jobs with scores, pagination, and optional server-side filters."""
         if not self.pool:
             await self.connect()
+
+        filter_clauses = []
+        filter_args: list = []
+        if contract_type:
+            filter_args.append(contract_type)
+            filter_clauses.append(f"j.contract_type ILIKE ${ len(filter_args) }")
+        if source:
+            filter_args.append(source)
+            filter_clauses.append(f"j.source = ${ len(filter_args) }")
+        where = ("WHERE " + " AND ".join(filter_clauses)) if filter_clauses else ""
+
         async with self.pool.acquire() as conn:
             if user_id:
+                uid_idx = len(filter_args) + 1
+                limit_idx = uid_idx + 1
+                offset_idx = uid_idx + 2
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT j.*,
                            js.semantic_score  AS semantic_score,
                            js.keyword_score   AS tfidf_score,
@@ -299,16 +329,19 @@ class DatabaseClient:
                            COALESCE(js.tech_stack, j.tech_stack) AS tech_stack,
                            js.scored_at, js.alerted
                     FROM jobs j
-                    LEFT JOIN job_scores js ON js.job_id = j.id AND js.user_id = $3
+                    LEFT JOIN job_scores js ON js.job_id = j.id AND js.user_id = ${uid_idx}
+                    {where}
                     ORDER BY js.composite_score DESC NULLS LAST, j.scraped_at DESC
-                    LIMIT $1 OFFSET $2
+                    LIMIT ${limit_idx} OFFSET ${offset_idx}
                     """,
-                    limit, offset, user_id
+                    *filter_args, user_id, limit, offset
                 )
             else:
+                limit_idx = len(filter_args) + 1
+                offset_idx = limit_idx + 1
                 rows = await conn.fetch(
-                    "SELECT * FROM jobs ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT $1 OFFSET $2",
-                    limit, offset
+                    f"SELECT * FROM jobs {where} ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}",
+                    *filter_args, limit, offset
                 )
             return [dict(r) for r in rows]
 
