@@ -116,9 +116,16 @@ class LesJeudiscraper(BaseScraper):
                     address_list = job.get("address", [])
                     location = address_list[0] if address_list else "France"
 
-                    # Contract type — LesJeudis Apollo state doesn't expose this directly;
-                    # default to cdi as the site is predominantly permanent IT roles.
-                    contract_type = "cdi"
+                    # LesJeudis Apollo state doesn't expose contract type directly;
+                    # derive from the query keyword used to fetch this result.
+                    if "alternance" in query_lower or "apprentissage" in query_lower:
+                        contract_type = "alternance"
+                    elif "stage" in query_lower:
+                        contract_type = "stage"
+                    elif "cdd" in query_lower:
+                        contract_type = "cdd"
+                    else:
+                        contract_type = "cdi"
 
                     # Salary info (bonus context for description)
                     salary_list = job.get("salaryRange", [])
