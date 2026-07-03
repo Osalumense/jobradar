@@ -2,7 +2,7 @@ import os
 import httpx
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Response, Request, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Response, Request, status, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -155,24 +155,34 @@ def extract_profile_tech(master_cv: str, explicit_tech: List[str]) -> List[str]:
 def build_search_queries(
     roles: List[str], tech: List[str], contracts: List[str], locations: List[str]
 ) -> List[str]:
-    """Build deterministic profile-driven queries without assuming a specific stack."""
+    """Build profile-driven queries ensuring each contract type has broad coverage."""
     if not roles and not tech:
         return GENERIC_SEARCH_QUERIES
 
     selected_roles = roles or ["développeur backend", "développeur fullstack"]
     selected_tech = tech or [""]
-    selected_contracts = contracts or ["cdi", "alternance"]
+    selected_contracts = [c.lower() for c in (contracts or ["cdi"])]
     selected_locations = locations or ["paris"]
 
     queries = []
     for contract in selected_contracts:
-        for role in selected_roles:
-            for item in selected_tech:
-                for location in selected_locations:
-                    query = " ".join(part for part in [contract, role, item, location] if part).strip()
-                    queries.append(query)
+        is_alternance = "alternance" in contract or "apprentissage" in contract
 
-    return _dedupe_keep_order(queries)[:12]
+        # Broad role-only queries per contract (no tech filter — catches more postings)
+        for role in selected_roles[:3]:
+            for loc in selected_locations[:2]:
+                q = " ".join(p for p in [contract, role, loc] if p).strip()
+                queries.append(q)
+
+        # Tech-specific queries only for CDI/non-alternance (alternance rarely filters by stack)
+        if not is_alternance:
+            for role in selected_roles[:2]:
+                for item in selected_tech[:3]:
+                    for loc in selected_locations[:1]:
+                        q = " ".join(p for p in [contract, role, item, loc] if p).strip()
+                        queries.append(q)
+
+    return _dedupe_keep_order(queries)[:20]
 
 
 # --- Helper: LLM Search Query Compiler ---
@@ -183,15 +193,20 @@ async def compile_search_queries(
     if not roles or not tech:
         return build_search_queries(roles, tech, contracts, locations)
 
+    has_alternance = any("alternance" in c.lower() or "apprentissage" in c.lower() for c in contracts)
     prompt = f"""
-    Create a clean list of exactly 6 optimized French job board search queries (comma-separated, e.g. "alternance développeur node paris") 
-    based on my preferences:
+    Create exactly 10 optimized French job board search queries (comma-separated) based on these preferences:
     - Target Roles: {', '.join(roles)}
     - Primary Technologies: {', '.join(tech)}
     - Contract Types: {', '.join(contracts)}
     - Target Locations: {', '.join(locations)}
 
-    Output ONLY the comma-separated search terms. Do not include introductory text, numbers, or code blocks.
+    Rules:
+    - Include 3–4 broad queries per contract type (role + location only, NO tech stack) — these catch the most results
+    - Include 2–3 tech-specific queries for non-alternance contracts only
+    {"- Alternance queries must NOT include specific tech stacks (too restrictive). Use broad terms like 'alternance développeur backend paris', 'alternance ingénieur informatique paris'" if has_alternance else ""}
+    - Write queries in French as they would be typed on a French job board
+    - Output ONLY comma-separated terms, no numbers, no quotes, no extra text.
     """
     
     try:
@@ -209,22 +224,31 @@ async def compile_search_queries(
 
 # --- Background Worker Trigger helper ---
 async def run_scraper_and_consume(user_id: Optional[str] = None):
-    """Runs all scrapers, enqueues raw jobs, and starts processing for a user."""
-    profile = await db_client.get_profile(user_id)
-    search_queries = []
-    if profile and profile.get("search_queries"):
-        search_queries = profile.get("search_queries")
-    
-    if not search_queries:
-        if profile:
-            search_queries = build_search_queries(
-                profile.get("target_roles", []),
-                profile.get("target_tech", []),
-                profile.get("target_contracts", []),
-                profile.get("target_locations", []),
+    """Scrape jobs using ALL users' combined queries, then rescore for every user."""
+    # Collect search queries from every user profile — global scrape pool
+    all_profiles = await db_client.get_all_profiles()
+    seen_queries: set = set()
+    search_queries: list = []
+
+    for p in all_profiles:
+        qs = p.get("search_queries") or []
+        if not qs:
+            qs = build_search_queries(
+                p.get("target_roles", []),
+                p.get("target_tech", []),
+                p.get("target_contracts", []),
+                p.get("target_locations", []),
             )
-        else:
-            search_queries = GENERIC_SEARCH_QUERIES
+        for q in qs:
+            q_norm = q.strip().lower()
+            if q_norm not in seen_queries:
+                seen_queries.add(q_norm)
+                search_queries.append(q)
+
+    if not search_queries:
+        search_queries = GENERIC_SEARCH_QUERIES
+
+    logger.info(f"Scraping with {len(search_queries)} deduplicated queries from {len(all_profiles)} user profiles")
 
     scrapers = [
         WelcomeToTheJungleScraper(),
@@ -233,59 +257,52 @@ async def run_scraper_and_consume(user_id: Optional[str] = None):
         LesJeudiscraper(),
         RemotiveScraper(),
     ]
-    
-    # Process queries for Remotive (needs clean keywords without French prepositions/stopwords)
-    cleaned_queries = []
-    for q in search_queries:
-        kw_list = []
-        for word in q.split():
-            w = word.lower().strip()
-            if w not in ["alternance", "cdi", "stage", "cdd", "paris", "développeur", "ingénieur", "france", "ile-de-france"]:
-                kw_list.append(w)
-        cleaned_queries.append(" ".join(kw_list) if kw_list else "developer")
+
+    # Remotive needs clean English keywords
+    stopwords = {"alternance", "cdi", "stage", "cdd", "paris", "développeur", "ingénieur", "france", "ile-de-france"}
+    cleaned_queries = list({
+        " ".join(w for w in q.split() if w.lower() not in stopwords) or "developer"
+        for q in search_queries
+    })
 
     started_at = datetime.utcnow()
     total_enqueued = 0
     async with httpx.AsyncClient() as client:
         for scraper in scrapers:
-            if scraper.source == "remotive":
-                scraper.search_queries = list(set(cleaned_queries))
-            else:
-                scraper.search_queries = search_queries
-
+            scraper.search_queries = cleaned_queries if scraper.source == "remotive" else search_queries
             run_id = await db_client.log_scrape_run(scraper.source, started_at)
             try:
                 raw_jobs = await scraper.run()
                 new_jobs_count = 0
                 for job in raw_jobs:
-                    is_duplicate = await job_queue.is_seen(client, job.content_hash)
-                    if not is_duplicate:
+                    if not await job_queue.is_seen(client, job.content_hash):
                         await job_queue.enqueue(client, job.to_dict())
                         new_jobs_count += 1
-
                 total_enqueued += new_jobs_count
-                logger.info(
-                    f"Scraper '{scraper.source}' done: {len(raw_jobs)} fetched, "
-                    f"{new_jobs_count} new, {len(raw_jobs) - new_jobs_count} duplicates"
-                )
-
+                logger.info(f"Scraper '{scraper.source}': {len(raw_jobs)} fetched, {new_jobs_count} new")
                 async with db_client.pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE scrape_runs SET finished_at = NOW(), jobs_found = $1, jobs_new = $2 WHERE id = $3",
+                        "UPDATE scrape_runs SET finished_at=NOW(), jobs_found=$1, jobs_new=$2 WHERE id=$3",
                         len(raw_jobs), new_jobs_count, run_id
                     )
             except Exception as e:
                 logger.error(f"Scraper error for {scraper.source}: {e}", exc_info=True)
                 async with db_client.pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE scrape_runs SET finished_at = NOW(), error = $1 WHERE id = $2",
-                        str(e), run_id
+                        "UPDATE scrape_runs SET finished_at=NOW(), error=$1 WHERE id=$2", str(e), run_id
                     )
 
-        logger.info(f"All scrapers done. Total new jobs enqueued: {total_enqueued}")
-
-        # Trigger queue consumption for the requesting user
+        logger.info(f"All scrapers done. {total_enqueued} new jobs. Consuming queue...")
+        # Consume the queue (score + embed) for the triggering user first for fast feedback
         await consumer.consume_all(client, user_id=user_id)
+
+    # After scraping, rescore all other users in the background so everyone's feed updates
+    other_user_ids = [p["user_id"] for p in all_profiles if p.get("user_id") and p["user_id"] != user_id]
+    for uid in other_user_ids:
+        try:
+            await _rescore_jobs_background(limit=200, user_id=uid)
+        except Exception as e:
+            logger.error(f"Post-scrape rescore failed for user {uid}: {e}")
 
 
 # --- Authentication REST Endpoints ---
@@ -457,11 +474,69 @@ async def delete_feat(feat_id: str, user: Dict[str, Any] = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Feat not found")
     return {"message": "Accomplishment deleted."}
 
+# --- CV File Parsing Endpoint ---
+@app.post("/api/profile/parse-cv")
+async def parse_cv_file(
+    file: UploadFile,
+    user: Dict[str, Any] = Depends(get_current_user_from_cookie)
+):
+    """Extract plain text from an uploaded CV file (PDF, DOCX, or TXT)."""
+    filename = (file.filename or "").lower()
+    content = await file.read()
+
+    try:
+        if filename.endswith(".pdf"):
+            import io, re
+            import pdfplumber
+            pages_text = []
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                for page in pdf.pages:
+                    words = page.extract_words(keep_blank_chars=False, use_text_flow=True)
+                    if not words:
+                        continue
+                    # Reconstruct lines by grouping words with similar y-coordinate,
+                    # then sort lines top-to-bottom. This handles any column layout.
+                    LINE_TOLERANCE = 5  # px — words within this y-range are on the same line
+                    lines: dict[int, list] = {}
+                    for w in words:
+                        y_bucket = round(w["top"] / LINE_TOLERANCE) * LINE_TOLERANCE
+                        lines.setdefault(y_bucket, []).append(w)
+                    page_lines = []
+                    for y in sorted(lines):
+                        line_words = sorted(lines[y], key=lambda w: w["x0"])
+                        page_lines.append(" ".join(w["text"] for w in line_words))
+                    pages_text.append("\n".join(page_lines))
+
+            text = "\n\n".join(pages_text)
+            # Collapse any remaining multi-space runs; preserve newlines
+            text = re.sub(r'[ \t]{2,}', ' ', text)
+            text = re.sub(r'\n{3,}', '\n\n', text)
+        elif filename.endswith(".docx"):
+            import io
+            from docx import Document
+            doc = Document(io.BytesIO(content))
+            text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        elif filename.endswith((".txt", ".md")):
+            text = content.decode("utf-8", errors="replace")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Upload a PDF, DOCX, TXT, or MD file.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not read file: {str(e)}")
+
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="No text could be extracted from this file.")
+
+    return {"text": text, "chars": len(text)}
+
 # --- User Profile & Onboarding Settings Endpoints ---
 @app.get("/api/profile")
 async def get_profile(user: Optional[Dict[str, Any]] = Depends(get_optional_user_from_cookie)):
-    profile = await db_client.get_user_profile()
+    user_email = user.get("sub") if user else None
     user_id = user.get("user_id") if user else None
+    profile = await db_client.get_user_profile(user_email)
     matching_criteria = await db_client.get_profile(user_id)
     return {
         "profile": profile,
@@ -526,27 +601,31 @@ async def save_profile(
                     profile.target_locations, search_queries, uid
                 )
         else:
-            await conn.execute(
-                """
-                INSERT INTO profile (
-                    id, profile_text, keywords, excluded, min_score,
-                    target_roles, target_tech, target_contracts, target_locations, search_queries, updated_at
-                ) VALUES (1, $1, $2, $3, 0.75, $4, $5, $6, $7, $8, NOW())
-                ON CONFLICT (id) DO UPDATE
-                SET profile_text = EXCLUDED.profile_text,
-                    keywords = EXCLUDED.keywords,
-                    excluded = EXCLUDED.excluded,
-                    target_roles = EXCLUDED.target_roles,
-                    target_tech = EXCLUDED.target_tech,
-                    target_contracts = EXCLUDED.target_contracts,
-                    target_locations = EXCLUDED.target_locations,
-                    search_queries = EXCLUDED.search_queries,
-                    updated_at = NOW()
-                """,
-                profile.master_cv[:2000], profile_tech, excluded,
-                profile.target_roles, profile_tech, profile.target_contracts,
-                profile.target_locations, search_queries
-            )
+            # Fallback: unauthenticated or missing user_id — upsert against user_id IS NULL row
+            anon_id = await conn.fetchval("SELECT id FROM profile WHERE user_id IS NULL LIMIT 1")
+            if anon_id:
+                await conn.execute(
+                    """
+                    UPDATE profile SET profile_text=$1, keywords=$2, excluded=$3, min_score=0.75,
+                        target_roles=$4, target_tech=$5, target_contracts=$6, target_locations=$7,
+                        search_queries=$8, updated_at=NOW()
+                    WHERE id=$9
+                    """,
+                    profile.master_cv[:2000], profile_tech, excluded,
+                    profile.target_roles, profile_tech, profile.target_contracts,
+                    profile.target_locations, search_queries, anon_id
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO profile (profile_text, keywords, excluded, min_score,
+                        target_roles, target_tech, target_contracts, target_locations, search_queries, updated_at)
+                    VALUES ($1, $2, $3, 0.75, $4, $5, $6, $7, $8, NOW())
+                    """,
+                    profile.master_cv[:2000], profile_tech, excluded,
+                    profile.target_roles, profile_tech, profile.target_contracts,
+                    profile.target_locations, search_queries
+                )
         
     return {
         "message": "Master profile and matching preferences successfully updated.",
@@ -588,7 +667,8 @@ async def generate_application_materials(
     if not job:
         raise HTTPException(status_code=404, detail=f"Job posting {job_id} not found.")
 
-    profile = await db_client.get_user_profile()
+    user_email = user.get("sub")
+    profile = await db_client.get_user_profile(user_email)
     if not profile or not profile.get("master_cv"):
         raise HTTPException(status_code=400, detail="Master CV must be configured in Settings first.")
 
@@ -637,12 +717,16 @@ async def get_application_materials(
 @app.get("/api/jobs")
 async def get_all_jobs(
     limit: int = 20,
+    offset: int = 0,
+    contract_type: Optional[str] = None,
+    source: Optional[str] = None,
     user: Optional[Dict[str, Any]] = Depends(get_optional_user_from_cookie)
 ):
-    """Fetch ranked jobs list. Returns per-user scores when authenticated, global scores otherwise."""
+    """Fetch ranked jobs list with pagination and optional server-side filters."""
     user_id = user.get("user_id") if user else None
-    jobs = await db_client.get_jobs(limit, user_id=user_id)
-    return {"jobs": jobs}
+    jobs = await db_client.get_jobs(limit, offset=offset, user_id=user_id, contract_type=contract_type, source=source)
+    total = await db_client.count_jobs(contract_type=contract_type, source=source)
+    return {"jobs": jobs, "total": total, "offset": offset, "limit": limit}
 
 @app.post("/api/rescore")
 async def rescore_existing_jobs(

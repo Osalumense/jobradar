@@ -21,8 +21,8 @@
         <div class="stat-value">{{ stats.offers }}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Saved Jobs</div>
-        <div class="stat-value">{{ jobs.length }}</div>
+        <div class="stat-label">Available Jobs</div>
+        <div class="stat-value">{{ total }}</div>
       </div>
     </section>
 
@@ -53,7 +53,13 @@
           </div>
         </div>
 
-        <div v-if="loading" class="loading-feed">
+        <div v-if="matching" class="matching-banner">
+          <span class="spinner-sm" />
+          Matching jobs to your profile… this takes about a minute.
+          <button class="btn-refresh" @click="fetchJobs">Refresh</button>
+        </div>
+
+        <div v-if="loading && jobs.length === 0" class="loading-feed">
           <div v-for="i in 4" :key="i" class="skeleton-card" />
         </div>
 
@@ -86,7 +92,20 @@
             </div>
           </div>
 
-          <div v-if="filteredJobs.length === 0" class="empty-feed">
+          <!-- Pagination -->
+          <div class="load-more-row">
+            <div v-if="loadingMore" class="loading-more">
+              <span class="spinner-sm" /> Loading more jobs…
+            </div>
+            <button v-else-if="!allLoaded && jobs.length > 0" class="btn-load-more" @click="loadMore">
+              Load more <span class="load-more-count">({{ jobs.length }} / {{ total }})</span>
+            </button>
+            <div v-else-if="allLoaded && jobs.length > 0" class="all-loaded">
+              All {{ total }} jobs loaded
+            </div>
+          </div>
+
+          <div v-if="filteredJobs.length === 0 && !loading" class="empty-feed">
             <svg viewBox="0 0 24 24" width="40" height="40"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
             <p>No jobs yet — click <strong>Scan Now</strong> to fetch from all sources.</p>
           </div>
@@ -210,7 +229,13 @@ const firstName = computed(() => {
   return name.charAt(0).toUpperCase() + name.slice(1)
 })
 
+const PAGE_SIZE = 20
+
 const jobs = ref<any[]>([])
+const total = ref(0)
+const offset = ref(0)
+const loadingMore = ref(false)
+const allLoaded = ref(false)
 const searchQueries = ref<string[]>([])
 const loading = ref(true)
 const scanning = ref(false)
@@ -252,19 +277,18 @@ const pipelineCount = computed(() =>
   jobs.value.filter(j => j.status === pipelineFilter.value).length
 )
 
+// Filtering is server-side; filteredJobs is just jobs as returned by the API
 const filteredJobs = computed(() => {
-  return jobs.value.filter(j => {
-    if (sourceFilter.value && j.source !== sourceFilter.value) return false
-    if (locationFilter.value && !j.location?.toLowerCase().includes(locationFilter.value.toLowerCase())) return false
-    if (selectedContracts.value.length && !selectedContracts.value.includes(j.contract_type?.toLowerCase())) return false
-    return true
-  })
+  if (!locationFilter.value) return jobs.value
+  const loc = locationFilter.value.toLowerCase()
+  return jobs.value.filter(j => j.location?.toLowerCase().includes(loc))
 })
 
 const toggleContract = (v: string) => {
   const idx = selectedContracts.value.indexOf(v)
   if (idx >= 0) selectedContracts.value.splice(idx, 1)
   else selectedContracts.value.push(v)
+  fetchJobs()
 }
 
 const scoreClass = (s: number | null) => {
@@ -282,13 +306,64 @@ const formatDesc = (txt: string) =>
 
 const openJob = (job: any) => { activeJob.value = job }
 
+const matching = ref(false)
+
+const buildJobsUrl = (pageOffset: number) => {
+  const params = new URLSearchParams()
+  params.set('limit', String(PAGE_SIZE))
+  params.set('offset', String(pageOffset))
+  if (selectedContracts.value.length === 1) params.set('contract_type', selectedContracts.value[0])
+  if (sourceFilter.value) params.set('source', sourceFilter.value)
+  return `/api/jobs?${params.toString()}`
+}
+
 const fetchJobs = async () => {
   loading.value = true
+  offset.value = 0
+  allLoaded.value = false
   try {
-    const data = await get('/api/jobs?limit=50')
-    jobs.value = data.jobs ?? data
+    const data = await get(buildJobsUrl(0))
+    jobs.value = data.jobs ?? []
+    total.value = data.total ?? 0
+    allLoaded.value = jobs.value.length >= total.value
   } catch {}
   loading.value = false
+}
+
+const loadMore = async () => {
+  if (loadingMore.value || allLoaded.value) return
+  loadingMore.value = true
+  try {
+    const nextOffset = offset.value + PAGE_SIZE
+    const data = await get(buildJobsUrl(nextOffset))
+    const newJobs = data.jobs ?? []
+    jobs.value = [...jobs.value, ...newJobs]
+    offset.value = nextOffset
+    total.value = data.total ?? total.value
+    allLoaded.value = jobs.value.length >= total.value
+  } catch {}
+  loadingMore.value = false
+}
+
+const autoMatchIfNeeded = async () => {
+  const hasScores = jobs.value.some(j => j.composite_score != null)
+  if (!hasScores && jobs.value.length > 0) {
+    matching.value = true
+    try {
+      await post('/api/rescore?limit=100')
+      let attempts = 0
+      const iv = setInterval(async () => {
+        await fetchJobs()
+        const done = jobs.value.some(j => j.composite_score != null)
+        if (done || ++attempts >= 12) {
+          clearInterval(iv)
+          matching.value = false
+        }
+      }, 8000)
+    } catch {
+      matching.value = false
+    }
+  }
 }
 
 const fetchProfile = async () => {
@@ -302,11 +377,16 @@ const triggerScraper = async () => {
   scanning.value = true
   try {
     await post('/api/scrape')
+    const prevTotal = total.value
     let attempts = 0
     const iv = setInterval(async () => {
       await fetchJobs()
-      if (++attempts >= 6) { clearInterval(iv); scanning.value = false }
-    }, 8000)
+      attempts++
+      if (total.value > prevTotal || attempts >= 20) {
+        clearInterval(iv)
+        scanning.value = false
+      }
+    }, 9000)
   } catch { scanning.value = false }
 }
 
@@ -318,7 +398,13 @@ const doRescore = async () => {
   } catch { rescoring.value = false }
 }
 
-onMounted(() => { fetchJobs(); fetchProfile() })
+watch(sourceFilter, () => fetchJobs())
+
+onMounted(async () => {
+  await fetchJobs()
+  fetchProfile()
+  autoMatchIfNeeded()
+})
 </script>
 
 <style scoped>
@@ -399,6 +485,29 @@ onMounted(() => { fetchJobs(); fetchProfile() })
 
 /* Skeletons */
 .loading-feed { display: flex; flex-direction: column; gap: 0.75rem; }
+.load-more-row { padding: 1.5rem 0; display: flex; justify-content: center; }
+.loading-more { display: flex; align-items: center; gap: 0.5rem; color: #64748b; font-size: 0.85rem; }
+.all-loaded { color: #374151; font-size: 0.8rem; }
+.btn-load-more {
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+  color: #94a3b8; border-radius: 10px; padding: 0.6rem 1.5rem;
+  font-size: 0.875rem; transition: all 0.15s;
+}
+.btn-load-more:hover { background: rgba(255,255,255,0.09); color: #e2e8f0; border-color: rgba(255,255,255,0.18); }
+.load-more-count { color: #475569; font-size: 0.8rem; }
+.matching-banner {
+  display: flex; align-items: center; gap: 0.75rem;
+  background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.2);
+  border-radius: 10px; padding: 0.75rem 1rem;
+  font-size: 0.875rem; color: #6ee7b7; margin-bottom: 0.5rem;
+}
+.btn-refresh {
+  margin-left: auto; background: none; border: 1px solid rgba(16,185,129,0.4);
+  color: #6ee7b7; border-radius: 6px; padding: 0.25rem 0.6rem;
+  font-size: 0.8rem;
+}
+.btn-refresh:hover { background: rgba(16,185,129,0.1); }
+
 .skeleton-card {
   height: 88px; border-radius: 14px;
   background: linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(255,255,255,0.06) 50%, rgba(255,255,255,0.03) 75%);

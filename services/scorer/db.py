@@ -27,8 +27,16 @@ class DatabaseClient:
             await self.pool.close()
             self.pool = None
 
+    async def get_all_profiles(self) -> List[Dict[str, Any]]:
+        """Fetch all user profiles for global scrape + rescore."""
+        if not self.pool:
+            await self.connect()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM profile WHERE user_id IS NOT NULL")
+            return [dict(r) for r in rows]
+
     async def get_profile(self, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Fetch the matching target profile for a user (falls back to id=1 if no user_id)."""
+        """Fetch the matching target profile for a user."""
         if not self.pool:
             await self.connect()
 
@@ -37,8 +45,8 @@ class DatabaseClient:
                 row = await conn.fetchrow("SELECT * FROM profile WHERE user_id = $1 LIMIT 1", user_id)
                 if row:
                     return dict(row)
-            # Fallback to legacy singleton row
-            row = await conn.fetchrow("SELECT * FROM profile WHERE id = 1 LIMIT 1")
+            # Fallback: return any row (single-user legacy or anonymous)
+            row = await conn.fetchrow("SELECT * FROM profile WHERE user_id IS NULL LIMIT 1")
             return dict(row) if row else None
 
     async def save_profile(self, profile_text: str, keywords: List[str], excluded: List[str], min_score: float, user_id: Optional[str] = None) -> None:
@@ -66,19 +74,17 @@ class DatabaseClient:
                         profile_text, keywords, excluded, min_score, user_id
                     )
             else:
-                await conn.execute(
-                    """
-                    INSERT INTO profile (id, profile_text, keywords, excluded, min_score, updated_at)
-                    VALUES (1, $1, $2, $3, $4, NOW())
-                    ON CONFLICT (id) DO UPDATE
-                    SET profile_text = EXCLUDED.profile_text,
-                        keywords = EXCLUDED.keywords,
-                        excluded = EXCLUDED.excluded,
-                        min_score = EXCLUDED.min_score,
-                        updated_at = NOW()
-                    """,
-                    profile_text, keywords, excluded, min_score
-                )
+                anon_id = await conn.fetchval("SELECT id FROM profile WHERE user_id IS NULL LIMIT 1")
+                if anon_id:
+                    await conn.execute(
+                        "UPDATE profile SET profile_text=$1, keywords=$2, excluded=$3, min_score=$4, updated_at=NOW() WHERE id=$5",
+                        profile_text, keywords, excluded, min_score, anon_id
+                    )
+                else:
+                    await conn.execute(
+                        "INSERT INTO profile (profile_text, keywords, excluded, min_score, updated_at) VALUES ($1, $2, $3, $4, NOW())",
+                        profile_text, keywords, excluded, min_score
+                    )
 
     async def insert_job(self, job: Dict[str, Any]) -> str:
         """Insert or update a scraped job, returning its database UUID."""
@@ -235,29 +241,31 @@ class DatabaseClient:
                 job_id, tailored_cv, cover_letter, qa_answers
             )
 
-    async def get_user_profile(self) -> Optional[Dict[str, Any]]:
-        """Retrieve master user profile containing base CV."""
+    async def get_user_profile(self, email: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieve master user profile containing base CV, scoped by email."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
-            # Get first profile row if exists
-            row = await conn.fetchrow("SELECT * FROM user_profiles LIMIT 1")
+            if email:
+                row = await conn.fetchrow("SELECT * FROM user_profiles WHERE email = $1 LIMIT 1", email)
+            else:
+                row = await conn.fetchrow("SELECT * FROM user_profiles LIMIT 1")
             return dict(row) if row else None
 
     async def save_user_profile(self, name: str, email: str, phone: str | None, github: str | None, linkedin: str | None, master_cv: str) -> None:
-        """Save/update the master user profile."""
+        """Save/update the master user profile, scoped by email."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
-            # Check if profile already exists
-            existing = await conn.fetchval("SELECT COUNT(*) FROM user_profiles")
-            if existing > 0:
+            existing = await conn.fetchval("SELECT id FROM user_profiles WHERE email = $1", email)
+            if existing:
                 await conn.execute(
                     """
                     UPDATE user_profiles
-                    SET full_name = $1, email = $2, phone = $3, github_url = $4, linkedin_url = $5, master_cv = $6, updated_at = NOW()
+                    SET full_name=$1, phone=$2, github_url=$3, linkedin_url=$4, master_cv=$5, updated_at=NOW()
+                    WHERE email=$6
                     """,
-                    name, email, phone, github, linkedin, master_cv
+                    name, phone, github, linkedin, master_cv, email
                 )
             else:
                 await conn.execute(
@@ -268,14 +276,51 @@ class DatabaseClient:
                     name, email, phone, github, linkedin, master_cv
                 )
 
-    async def get_jobs(self, limit: int = 20, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch scraped jobs with scores. If user_id, merges per-user scores from job_scores."""
+    async def count_jobs(self, contract_type: Optional[str] = None, source: Optional[str] = None) -> int:
+        """Return total number of scraped jobs, optionally filtered."""
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
+            where_clauses = []
+            args = []
+            if contract_type:
+                args.append(contract_type)
+                where_clauses.append(f"contract_type ILIKE ${ len(args) }")
+            if source:
+                args.append(source)
+                where_clauses.append(f"source = ${ len(args) }")
+            where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            return await conn.fetchval(f"SELECT COUNT(*) FROM jobs {where}", *args)
+
+    async def get_jobs(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        user_id: Optional[str] = None,
+        contract_type: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch scraped jobs with scores, pagination, and optional server-side filters."""
+        if not self.pool:
+            await self.connect()
+
+        filter_clauses = []
+        filter_args: list = []
+        if contract_type:
+            filter_args.append(contract_type)
+            filter_clauses.append(f"j.contract_type ILIKE ${ len(filter_args) }")
+        if source:
+            filter_args.append(source)
+            filter_clauses.append(f"j.source = ${ len(filter_args) }")
+        where = ("WHERE " + " AND ".join(filter_clauses)) if filter_clauses else ""
+
+        async with self.pool.acquire() as conn:
             if user_id:
+                uid_idx = len(filter_args) + 1
+                limit_idx = uid_idx + 1
+                offset_idx = uid_idx + 2
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT j.*,
                            js.semantic_score  AS semantic_score,
                            js.keyword_score   AS tfidf_score,
@@ -284,16 +329,19 @@ class DatabaseClient:
                            COALESCE(js.tech_stack, j.tech_stack) AS tech_stack,
                            js.scored_at, js.alerted
                     FROM jobs j
-                    LEFT JOIN job_scores js ON js.job_id = j.id AND js.user_id = $2
+                    LEFT JOIN job_scores js ON js.job_id = j.id AND js.user_id = ${uid_idx}
+                    {where}
                     ORDER BY js.composite_score DESC NULLS LAST, j.scraped_at DESC
-                    LIMIT $1
+                    LIMIT ${limit_idx} OFFSET ${offset_idx}
                     """,
-                    limit, user_id
+                    *filter_args, user_id, limit, offset
                 )
             else:
+                limit_idx = len(filter_args) + 1
+                offset_idx = limit_idx + 1
                 rows = await conn.fetch(
-                    "SELECT * FROM jobs ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT $1",
-                    limit
+                    f"SELECT * FROM jobs {where} ORDER BY composite_score DESC NULLS LAST, scraped_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}",
+                    *filter_args, limit, offset
                 )
             return [dict(r) for r in rows]
 

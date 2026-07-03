@@ -52,10 +52,19 @@ class WelcomeToTheJungleScraper(BaseScraper):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
 
-        location_filter = 'office.city:Paris' if "paris" in query.lower() else ''
-        params_str = f"query={keyword_param}"
-        if location_filter:
-            params_str += f"&facetFilters=[[\"{location_filter}\"]]"
+        query_lower = query.lower()
+        is_alternance = "alternance" in query_lower or "apprentissage" in query_lower
+
+        facet_filters = []
+        if "paris" in query_lower:
+            facet_filters.append(["office.city:Paris"])
+        if is_alternance:
+            facet_filters.append(["contract_type:apprenticeship"])
+
+        params_str = f"query={keyword_param}&hitsPerPage=100"
+        if facet_filters:
+            import json as _json
+            params_str += f"&facetFilters={_json.dumps(facet_filters)}"
 
         payload = {
             "requests": [
@@ -80,7 +89,7 @@ class WelcomeToTheJungleScraper(BaseScraper):
                     return
 
                 hits = results[0].get("hits", [])
-                logger.info(f"WTTJ query '{query}': {len(hits)} hits")
+                logger.info(f"WTTJ query '{query}': {len(hits)} hits (alternance={is_alternance})")
 
                 for hit in hits:
                     slug = hit.get("slug")

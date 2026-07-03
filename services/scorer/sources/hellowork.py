@@ -83,7 +83,7 @@ class HelloWorkScraper(BaseScraper):
         clean_words = [w for w in query.split() if w.lower().strip() not in STOPWORDS]
         keyword_param = " ".join(clean_words) if clean_words else "backend"
 
-        params = {"k": keyword_param, "l": location_param}
+        params = {"k": keyword_param, "l": location_param, "p": "1"}
         if contract_param:
             params["c"] = contract_param
 
@@ -159,7 +159,7 @@ class HelloWorkScraper(BaseScraper):
                     })
                     detail_tasks.append(self._fetch_full_description(client, url, headers))
 
-                    if len(jobs_to_process) >= 10:
+                    if len(jobs_to_process) >= 30:
                         break
 
                 logger.info(f"HelloWork query '{query}': {len(jobs_to_process)} listings found")
