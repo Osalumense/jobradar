@@ -21,8 +21,8 @@
         <div class="stat-value">{{ stats.offers }}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Saved Jobs</div>
-        <div class="stat-value">{{ jobs.length }}</div>
+        <div class="stat-label">Available Jobs</div>
+        <div class="stat-value">{{ total }}</div>
       </div>
     </section>
 

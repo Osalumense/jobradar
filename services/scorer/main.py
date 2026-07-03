@@ -155,24 +155,34 @@ def extract_profile_tech(master_cv: str, explicit_tech: List[str]) -> List[str]:
 def build_search_queries(
     roles: List[str], tech: List[str], contracts: List[str], locations: List[str]
 ) -> List[str]:
-    """Build deterministic profile-driven queries without assuming a specific stack."""
+    """Build profile-driven queries ensuring each contract type has broad coverage."""
     if not roles and not tech:
         return GENERIC_SEARCH_QUERIES
 
     selected_roles = roles or ["développeur backend", "développeur fullstack"]
     selected_tech = tech or [""]
-    selected_contracts = contracts or ["cdi", "alternance"]
+    selected_contracts = [c.lower() for c in (contracts or ["cdi"])]
     selected_locations = locations or ["paris"]
 
     queries = []
     for contract in selected_contracts:
-        for role in selected_roles:
-            for item in selected_tech:
-                for location in selected_locations:
-                    query = " ".join(part for part in [contract, role, item, location] if part).strip()
-                    queries.append(query)
+        is_alternance = "alternance" in contract or "apprentissage" in contract
 
-    return _dedupe_keep_order(queries)[:12]
+        # Broad role-only queries per contract (no tech filter — catches more postings)
+        for role in selected_roles[:3]:
+            for loc in selected_locations[:2]:
+                q = " ".join(p for p in [contract, role, loc] if p).strip()
+                queries.append(q)
+
+        # Tech-specific queries only for CDI/non-alternance (alternance rarely filters by stack)
+        if not is_alternance:
+            for role in selected_roles[:2]:
+                for item in selected_tech[:3]:
+                    for loc in selected_locations[:1]:
+                        q = " ".join(p for p in [contract, role, item, loc] if p).strip()
+                        queries.append(q)
+
+    return _dedupe_keep_order(queries)[:20]
 
 
 # --- Helper: LLM Search Query Compiler ---
@@ -183,15 +193,20 @@ async def compile_search_queries(
     if not roles or not tech:
         return build_search_queries(roles, tech, contracts, locations)
 
+    has_alternance = any("alternance" in c.lower() or "apprentissage" in c.lower() for c in contracts)
     prompt = f"""
-    Create a clean list of exactly 6 optimized French job board search queries (comma-separated, e.g. "alternance développeur node paris") 
-    based on my preferences:
+    Create exactly 10 optimized French job board search queries (comma-separated) based on these preferences:
     - Target Roles: {', '.join(roles)}
     - Primary Technologies: {', '.join(tech)}
     - Contract Types: {', '.join(contracts)}
     - Target Locations: {', '.join(locations)}
 
-    Output ONLY the comma-separated search terms. Do not include introductory text, numbers, or code blocks.
+    Rules:
+    - Include 3–4 broad queries per contract type (role + location only, NO tech stack) — these catch the most results
+    - Include 2–3 tech-specific queries for non-alternance contracts only
+    {"- Alternance queries must NOT include specific tech stacks (too restrictive). Use broad terms like 'alternance développeur backend paris', 'alternance ingénieur informatique paris'" if has_alternance else ""}
+    - Write queries in French as they would be typed on a French job board
+    - Output ONLY comma-separated terms, no numbers, no quotes, no extra text.
     """
     
     try:
