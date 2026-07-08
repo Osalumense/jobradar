@@ -1,140 +1,101 @@
-# JobRadar AI
+# 🎯 JobRadar AI
 
-JobRadar AI is a self-hosted, AI-powered job search and application platform. It automatically scrapes French job boards for **CDI**, **Alternance**, **CDD**, and **Stage** roles, ranks them per user using semantic and keyword matching, and uses Google Gemini to generate tailored CVs and cover letters based on your personal accomplishments vault.
+[![Python](https://img.shields.io/badge/Python-3.12-blue.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688.svg?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Nuxt 3](https://img.shields.io/badge/Nuxt-3-00DC82.svg?style=flat-square&logo=nuxt.js&logoColor=white)](https://nuxt.com)
+[![Gemini AI](https://img.shields.io/badge/Gemini_AI-text--embedding--004-orange.svg?style=flat-square&logo=google-gemini&logoColor=white)](https://aistudio.google.com)
+[![PostgreSQL](https://img.shields.io/badge/Neon_Postgres-Serverless-blue.svg?style=flat-square&logo=postgresql&logoColor=white)](https://neon.tech)
+[![Redis](https://img.shields.io/badge/Upstash_Redis-REST_Queue-red.svg?style=flat-square&logo=redis&logoColor=white)](https://upstash.com)
 
----
-
-## Screenshots
-
-### Login
-![Login](docs/screenshots/login.png)
-
-### Dashboard — Job Feed
-![Dashboard](docs/screenshots/dashboard.png)
-
-### Dashboard — Alternance Filter
-![Dashboard Alternance Filter](docs/screenshots/dashboard_alternance.png)
-
-### Application Pipeline
-![Pipeline](docs/screenshots/pipeline.png)
+**JobRadar AI** is a self-hosted, AI-powered job search and application platform. It automatically scrapes French job boards for **CDI**, **Alternance**, **CDD**, and **Stage** roles, ranks them per user using a **Hybrid Semantic & Keyword Matching Engine**, and leverages Google Gemini to generate tailored CVs and cover letters based on your personal **Accomplishments Vault**.
 
 ---
 
-## Features
+## 📸 Screenshots
 
-- **Multi-source scraping**: Welcome to the Jungle, HelloWork, France Travail, LesJeudis, and Remotive — running on every "Scan Now" trigger.
-- **Global + per-user pipeline**: Scraper collects queries from all user profiles, deduplicates, runs once, then rescores every user independently.
-- **Hybrid scoring** per user:
-  - *Semantic score (55%)*: Cosine similarity via Google Gemini embeddings
-  - *TF-IDF score (30%)*: Keyword match against profile criteria
-  - *Recency decay (15%)*: Deprioritises stale postings
-- **Server-side filtering**: Filter by contract type (CDI / Alternance / Internship / CDD) or source — results come directly from the DB, not from the loaded page slice.
-- **Pagination**: "Load More" button with live count (N / total); filters reset and re-fetch automatically.
-- **AI application materials**: Gemini generates tailored CVs (Markdown) and French cover letters (*Moi, Vous, Nous* layout) per job posting.
-- **Accomplishments Vault**: Record and tag project feats; Gemini pulls the most relevant ones into each application.
-- **Application pipeline**: Kanban-style status tracking (Applied → Reviewing → Interviewing → Offer).
-- **Multi-user**: Each user has isolated profile, scores, and application history. Onboarding collects matching criteria (roles, contracts, locations, tech stack).
-- **Email alerts**: Resend-powered notifications for high-matching new postings.
-- **Password reset**: Token-based flow with email delivery.
+<div align="center">
+  <h3>1. Dashboard & Job Feed</h3>
+  <img src="docs/screenshots/dashboard.png" width="80%" alt="Dashboard Feed" />
+  
+  <h3>2. Kanban Application Pipeline</h3>
+  <img src="docs/screenshots/pipeline.png" width="80%" alt="Pipeline Kanban" />
+  
+  <h3>3. Alternance Filter</h3>
+  <img src="docs/screenshots/dashboard_alternance.png" width="80%" alt="Dashboard Filters" />
+</div>
 
 ---
 
-## Tech Stack
+## 📖 Deep-Dive Documentation Index
 
-| Layer | Technology |
-|-------|-----------|
-| Backend | Python 3.12, FastAPI, asyncpg |
-| Scraping | httpx, BeautifulSoup4, Algolia API (WTTJ) |
-| AI / Scoring | Google Gemini API, scikit-learn TF-IDF |
-| Frontend | Nuxt 3, Vue 3, Vanilla CSS |
-| Database | Neon Serverless PostgreSQL |
-| Queue / Dedup | Upstash Redis (REST) |
-| Email | Resend |
-| Containers | Docker Compose |
+To keep this README concise, detailed guides are organized into separate files. Click the links below to explore each area:
+
+1. 🏛️ **[System Architecture](file:///Users/stephenakugbe/Documents/nodejs/jobradar/docs/architecture.md)** — Architectural layout, component topologies, ingestion sequence, and backend-worker relations.
+2. 🧮 **[Scraping & Scoring Engine](file:///Users/stephenakugbe/Documents/nodejs/jobradar/docs/scraping-and-scoring.md)** — Core details on the five board scrapers (WTTJ, HelloWork, France Travail, LesJeudis, Remotive) and the exact math/weights behind the Hybrid Scoring formula.
+3. 🔌 **[API Reference Guide](file:///Users/stephenakugbe/Documents/nodejs/jobradar/docs/api.md)** — Detailed endpoint catalog for authentication, profiles, CV parsing, job retrieval, and AI material generation.
+4. ⚙️ **[Development & Setup Guide](file:///Users/stephenakugbe/Documents/nodejs/jobradar/docs/development-and-setup.md)** — Complete step-by-step developer instructions for Docker Compose and bare-metal installations, environment configurations, database seeds, and troubleshooting.
 
 ---
 
-## Repository Structure
+## ✨ Features
 
-```
-jobradar/
-├── services/
-│   └── scorer/                 # FastAPI backend + scraping pipeline
-│       ├── sources/            # Board scrapers
-│       │   ├── wttj.py         # Welcome to the Jungle (Algolia API)
-│       │   ├── hellowork.py    # HelloWork (HTML scrape)
-│       │   ├── france_travail.py  # France Travail (official API)
-│       │   ├── lesjeudis.py    # LesJeudis (Apollo state)
-│       │   └── remotive.py     # Remotive (JSON API)
-│       ├── main.py             # FastAPI endpoints (auth, jobs, scrape, score)
-│       ├── db.py               # asyncpg database client
-│       ├── scorer.py           # Hybrid scoring logic
-│       ├── generator.py        # Gemini CV / cover letter generation
-│       └── requirements.txt
-├── frontend/                   # Nuxt 3 SPA
-│   └── app/
-│       ├── pages/              # Dashboard, Jobs, Pipeline, Analytics, Profile
-│       └── components/         # Job cards, modals, charts
-├── docker-compose.yml
-├── .env.example                # All required environment variables
-└── README.md
-```
+- **Multi-Source Scraping Engine**: Simultaneously crawls Welcome to the Jungle, HelloWork, France Travail (Pôle Emploi API), LesJeudis, and Remotive with automatic deduplication.
+- **Hybrid Multi-User Scoring Engine**:
+  - **Semantic Cosine Similarity (45%)** via Google Gemini Embeddings (`text-embedding-004`).
+  - **TF-IDF Keyword Relevance Match (40%)** comparing job details with target tech skills.
+  - **Recency decay (15%)** to deprioritize older listings.
+  - **Location & Contract Type Filtering** (CDI, CDD, Stage, Alternance) with a penalty multiplier for mismatches.
+- **Accomplishments Vault**: Manage and tag personal projects, achievements, and work feats.
+- **AI Application Materials Generation**: Connects to Gemini to suggest top matching achievements for a job and output custom CV adjustment notes and formal French cover letters (*Moi, Vous, Nous* structure).
+- **Kanban Application Pipeline**: Drag-and-drop tracker for job states: `Applied` → `Reviewing` → `Interviewing` → `Offer`.
+- **Deduplication Cache**: Integrated Upstash Redis REST calls to avoid double-processing and manage Gemini token limits.
+- **Automatic Alerts & Recovery**: High-matching new postings trigger automated emails using Resend. Secure password reset links sent directly to inbox.
 
 ---
 
-## Getting Started
+## 🚀 Quick Setup (Docker Compose)
 
-### 1. Clone and configure
+The easiest way to start JobRadar AI is using Docker Compose.
 
-```bash
-git clone https://github.com/Osalumense/jobradar.git
-cd jobradar
-cp .env.example .env
-# Edit .env and fill in your credentials
-```
+1. **Clone the Repo:**
+   ```bash
+   git clone https://github.com/Osalumense/jobradar.git
+   cd jobradar
+   ```
 
-### 2. Required credentials
+2. **Configure `.env` variables:**
+   ```bash
+   cp .env.example .env
+   # Open .env and add your Neon Postgres, Gemini, Upstash Redis, and Resend keys.
+   ```
 
-| Variable | Where to get it |
-|----------|----------------|
-| `DATABASE_URL` | [Neon](https://neon.tech) — free tier PostgreSQL |
-| `JWT_SECRET_KEY` | `python3 -c "import secrets; print(secrets.token_hex(64))"` |
-| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/app/apikey) — free tier |
-| `UPSTASH_REDIS_REST_URL` + `TOKEN` | [Upstash](https://console.upstash.com/) — free tier Redis |
-| `RESEND_API_KEY` | [Resend](https://resend.com) — free tier (100 emails/day) |
+3. **Spin up the stack:**
+   ```bash
+   docker compose up --build
+   ```
 
-### 3. Run with Docker Compose
-
-```bash
-docker compose up --build
-```
-
-- Frontend: http://localhost:3078
-- Backend API: http://localhost:9089
-
-### 4. First-time setup
-
-1. Register an account at `http://localhost:3078/register`
-2. Complete onboarding (upload CV, set target roles, contracts, locations)
-3. Click **Scan Now** on the dashboard — scrapes all sources and scores jobs against your profile
-4. Use the contract-type and source filters to narrow results instantly
+- **Frontend Application**: `http://localhost:3078`
+- **Backend Swagger API Docs**: `http://localhost:9089/docs`
 
 ---
 
-## Database
+## 🛠️ Database Schema
 
-The app manages its own schema on first run via `db.py`. Key tables:
+When the API starts, the database connection (`db.py`) automatically compiles and structures the following tables:
 
-| Table | Purpose |
-|-------|---------|
-| `users` | Auth credentials |
-| `user_profiles` | CV, contact info, per-user |
-| `profile` | Matching criteria (roles, queries, contracts) per user |
-| `jobs` | All scraped job postings |
-| `job_scores` | Per-user composite scores |
+| Table | Description |
+|---|---|
+| `users` | Handles user authentication and secure token reset mechanisms. |
+| `user_profiles` | Houses CV text, user location, name, and profile URLs. |
+| `profile` | Stores target roles, target locations, contract types, and target tech stack. |
+| `jobs` | Contains raw scraped job fields (URL, Description, Location, Company, Contract, etc.) for all sources. |
+| `job_scores` | Tracks per-user scores (semantic, keyword, recency, composite) and matched tech stack tags. |
+| `feats` | Stores the Accomplishments Vault entries linked to users. |
+| `applications` | Tracks user-submitted application pipelines and status stages. |
 
 ---
 
-## Environment Variables Reference
+## 👥 Authors & License
 
-See [`.env.example`](./.env.example) for the full list with descriptions.
+- Created by **Stephen Akugbe** ([Osalumense](https://github.com/Osalumense)).
+- Released under the MIT License. See [LICENSE](LICENSE) for details.
